@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>숲속 루미큐브 AI 4인용</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="start-screen" class="screen">
+    <div class="menu-box">
+      <div class="menu-title">🐾 숲속 루미큐브</div>
+      <div class="menu-desc">
+        4인용 테이블 구조 + 테이블 재배열 + 조커/30점 룰 옵션을 넣은 버전입니다.<br />
+        빠른 시작도 현재 선택된 옵션을 그대로 사용합니다.
+      </div>
+
+      <div id="menu-main">
+        <div class="menu-section-title">빠른 시작</div>
+        <button class="btn-lg btn-orange" onclick="game.quickStart(2)">
+          <div>2인 로컬 대전</div>
+          <span>🐰⚔️🦝</span>
+        </button>
+        <button class="btn-lg btn-purple" onclick="game.quickStart(4)">
+          <div>4인 로컬 테이블</div>
+          <span>🐰🦝🦊🦉</span>
+        </button>
+        <button class="btn-lg btn-green" onclick="game.quickStartMixed()">
+          <div>1인 + AI 3명</div>
+          <span id="quick-mixed-level" class="quick-ai-chip" onclick="event.stopPropagation(); game.cycleQuickStartMixedLevel()">AI-3 보통</span>
+        </button>
+
+        <div class="menu-section-title">룰 옵션</div>
+        <div id="rule-options-main" class="setup-container"></div>
+
+        <div class="menu-section-title">사용자 설정</div>
+        <button class="btn-lg btn-blue" onclick="ui.showSetup()">
+          <div>플레이어 구성 커스텀</div>
+          <span>⚙️</span>
+        </button>
+      </div>
+
+      <div id="menu-setup">
+        <div class="menu-section-title">플레이어 설정</div>
+        <div id="setup-container" class="setup-container"></div>
+
+        <div class="menu-section-title">룰 옵션</div>
+        <div id="rule-options-setup" class="setup-container"></div>
+
+        <div class="setup-brief">
+          플레이어 구성과 룰을 정한 뒤 게임을 시작하세요.
+        </div>
+
+        <details class="setup-help">
+          <summary>게임 규칙 자세히 보기</summary>
+          <div class="setup-help-body">
+            <div class="setup-help-item">
+              <strong>플레이어 상태</strong>
+              HUMAN / AI-1 / AI-2 / AI-3 / AI-4 / AI-5 / AI-6 / OFF 순서로 전환됩니다.
+            </div>
+            <div class="setup-help-item">
+              <strong>AI 난이도</strong>
+              AI-1 초급부터 AI-6 챌린지까지 단계적으로 강해집니다.
+            </div>
+            <div class="setup-help-item">
+              <strong>AI-6 챌린지</strong>
+              타일 카운팅을 사용하는 최고 난도입니다.
+            </div>
+            <div class="setup-help-item">
+              <strong>30점 등록</strong>
+              첫 성공 턴에는 자기 손패만으로 30점 이상 새 줄을 내야 하며, 그 전에는 기존 테이블을 건드릴 수 없습니다.
+            </div>
+          </div>
+        </details>
+
+        <button class="btn-lg btn-orange" onclick="game.startCustom()">
+          <div>게임 시작</div>
+          <span>🍁</span>
+        </button>
+        <button class="btn-lg btn-gray" onclick="ui.hideSetup()">
+          <div>뒤로</div>
+          <span>↩️</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="game-screen" class="screen hidden">
+    <div class="game-layout">
+      <aside class="panel panel-left">
+        <div class="panel-title">🌲 플레이어 현황</div>
+        <div id="player-list" class="player-list"></div>
+      </aside>
+
+      <main class="center-stage">
+        <section class="table-shell">
+          <div class="table-header">
+            <div>
+              <div class="table-title">🍂 중앙 테이블</div>
+              <div class="table-sub">손패 타일뿐 아니라 테이블 타일까지 선택해서 새 줄 만들기 / 줄에 추가가 가능합니다. 턴 종료 시 모든 줄이 유효해야 합니다.</div>
+            </div>
+            <div class="chip-row">
+              <div class="chip">가방 <span id="bag-count">0</span>장</div>
+              <div class="chip">턴 <span id="turn-label">-</span></div>
+              <div class="chip">선택 <span id="selected-count">0</span>장</div>
+              <div class="chip" id="rule-joker-chip">조커 OFF</div>
+              <div class="chip" id="rule-open-chip">30룰 OFF</div>
+            </div>
+          </div>
+          <div id="table-area" class="table-area"></div>
+        </section>
+
+        <section class="rack-panel">
+          <div class="rack-head">
+            <div class="rack-title"><strong id="rack-owner">토끼</strong> 손패</div>
+            <div class="chip-row">
+              <div id="selection-label" class="chip">선택 없음</div>
+              <div id="group-label" class="chip">선택 줄 없음</div>
+            </div>
+          </div>
+          <div class="rack-scroller">
+            <div id="rack-row" class="rack-row"></div>
+          </div>
+        </section>
+      </main>
+
+      <aside class="panel panel-right">
+        <div>
+          <div class="info-box">
+            <div id="info-title" class="info-title">플레이 안내</div>
+            <div id="info-text" class="info-text">손패 타일뿐 아니라 테이블 타일까지 선택해서 새 줄 만들기와 줄에 추가가 가능합니다. 턴 종료 시 모든 줄이 유효해야 합니다.</div>
+          </div>
+
+          <div class="control-stack" style="margin-top:14px;">
+            <div class="control-row">
+              <button id="btn-sort-color" class="btn btn-sort" onclick="game.sortRack('color')">🎨 색 정렬</button>
+              <button id="btn-sort-number" class="btn btn-sort" onclick="game.sortRack('number')">🔢 숫자 정렬</button>
+            </div>
+            <div class="control-row">
+              <button id="btn-new-group" class="btn btn-grouping" onclick="game.createGroupFromSelection()">✨ 새 줄</button>
+              <button id="btn-append-group" class="btn btn-grouping" onclick="game.appendSelectionToSelectedGroup()">➕ 줄에 추가</button>
+            </div>
+            <div class="control-row">
+              <button id="btn-clear-select" class="btn btn-clear" onclick="game.clearSelections()">🧹 선택 해제</button>
+              <button id="btn-undo-action" class="btn btn-undo" onclick="game.undoTurnAction()">↩️ 무르기</button>
+            </div>
+            <div class="control-row">
+              <button id="btn-request-hint" class="btn btn-hint" onclick="game.requestHint()">💡 힌트</button>
+            </div>
+            <div class="control-row">
+              <button id="btn-draw-tile" class="btn btn-draw" onclick="game.drawTile()">🪵 1장 뽑기</button>
+              <button id="btn-end-turn" class="btn btn-end" onclick="game.endTurn()">✅ 턴 종료</button>
+            </div>
+          </div>
+        </div>
+
+        <button class="btn btn-menu" onclick="game.toMenu()">🏠 메뉴로</button>
+      </aside>
+    </div>
+    <div id="toast" class="toast">알림</div>
+  </div>
+
+  <div id="modal" class="overlay">
+    <div class="overlay-box">
+      <div id="win-emoji" class="overlay-emoji">🏆</div>
+      <div id="win-title" class="overlay-title">승리!</div>
+      <div id="win-text" class="overlay-text">손패를 먼저 비운 동물이 승리합니다.</div>
+      <div class="control-row">
+        <button class="btn btn-end" onclick="game.restart()">다시 하기</button>
+        <button class="btn btn-menu" onclick="game.toMenu()">메뉴로</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="shared/constants.js"></script>
+  <script src="shared/rules-core.js"></script>
+  <script src="shared/utils.js"></script>
+  <script src="js/ai-bridge.js"></script>
+  <script src="js/game.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
