@@ -1232,14 +1232,44 @@ class AIBaseStrategy {
         const jokerTile = group.find(tile => tile.id === assignment.tileId);
         if (!jokerTile) continue;
 
-        const replacements = state.rack.filter(tile =>
+        const isExactReplacementTile = tile =>
           !tile.joker
           && tile.number === assignment.actsAsNumber
-          && (!assignment.actsAsColor || tile.color === assignment.actsAsColor)
-        );
+          && (!assignment.actsAsColor || tile.color === assignment.actsAsColor);
+        const replacementOptions = state.rack
+          .filter(isExactReplacementTile)
+          .map(tile => ({
+            source: "rack",
+            tile,
+            donorGroupIndex: null,
+            donorRemainingGroups: []
+          }));
 
-        for (const replacement of replacements) {
+        if ((this.config.maxTouchedGroups || 1) >= 2) {
+          for (let otherIndex = 0; otherIndex < state.table.length; otherIndex += 1) {
+            if (otherIndex === groupIndex) continue;
+            const donorPlans = this.getRemovalPlans(state.table[otherIndex], ctx, {
+              maxRemove: 1,
+              maxSolutions: 4,
+              allowZero: false
+            });
+            donorPlans.forEach(plan => {
+              if (plan.removedTiles.length !== 1) return;
+              const donorTile = plan.removedTiles[0];
+              if (!isExactReplacementTile(donorTile)) return;
+              replacementOptions.push({
+                source: "table",
+                tile: donorTile,
+                donorGroupIndex: otherIndex,
+                donorRemainingGroups: deepCopy(plan.remainingGroups)
+              });
+            });
+          }
+        }
+
+        for (const option of replacementOptions) {
           if (this.isTimedOut(ctx)) break;
+          const replacement = option.tile;
 
           const substitutedGroup = normalizeGroupTiles(
             group
@@ -1255,7 +1285,7 @@ class AIBaseStrategy {
             remainingGroups: []
           }];
 
-          if ((this.config.maxTouchedGroups || 1) >= 2) {
+          if (option.source === "rack" && (this.config.maxTouchedGroups || 1) >= 2) {
             for (let otherIndex = 0; otherIndex < state.table.length; otherIndex += 1) {
               if (otherIndex === groupIndex) continue;
               const plans = this.getRemovalPlans(state.table[otherIndex], ctx, {
@@ -1276,7 +1306,8 @@ class AIBaseStrategy {
 
           for (const plan of externalPlans) {
             if (this.isTimedOut(ctx)) break;
-            const rackSubsets = this.getRearrangementRackSubsets(state, ctx, [jokerTile, ...plan.removedTiles])
+            const seedTableTiles = [jokerTile, ...plan.removedTiles];
+            const rackSubsets = this.getRearrangementRackSubsets(state, ctx, seedTableTiles)
               .filter(subset => !subset.ids.includes(replacement.id));
 
             for (const subset of rackSubsets) {
@@ -1292,24 +1323,41 @@ class AIBaseStrategy {
               partitions.slice(0, maxSolutions).forEach(partition => {
                 if (!partition.groups.some(createdGroup => createdGroup.some(tile => tile.id === jokerTile.id))) return;
 
-                const sourceGroupIndices = plan.groupIndex === null
-                  ? [groupIndex]
-                  : [groupIndex, plan.groupIndex];
-                const detailText = `${groupIndex + 1}번 줄의 조커를 손패 ${formatTileText(replacement)}로 대체하고, 해방된 조커로 새 줄을 만드세요.`;
+                const replacementLabel = option.source === "table"
+                  ? `${(option.donorGroupIndex || 0) + 1}번 줄의 ${formatTileText(replacement)}`
+                  : `손패 ${formatTileText(replacement)}`;
+                const sourceGroupIndices = option.source === "table"
+                  ? [groupIndex, option.donorGroupIndex]
+                  : (plan.groupIndex === null ? [groupIndex] : [groupIndex, plan.groupIndex]);
+                const sourceTableIds = option.source === "table"
+                  ? [jokerTile.id, replacement.id]
+                  : [jokerTile.id, ...plan.removedTiles.map(tile => tile.id)];
+                const sourceRackIds = option.source === "table"
+                  ? [...subset.ids]
+                  : [replacement.id, ...subset.ids];
+                const retainedGroups = option.source === "table"
+                  ? [substitutedGroup, ...deepCopy(option.donorRemainingGroups)]
+                  : [substitutedGroup, ...plan.remainingGroups];
+                const detailText = option.source === "table"
+                  ? `${groupIndex + 1}번 줄의 조커를 ${replacementLabel}로 대체하고, 해방된 조커를 다시 활용하세요.`
+                  : `${groupIndex + 1}번 줄의 조커를 ${replacementLabel}로 대체하고, 해방된 조커로 새 줄을 만드세요.`;
                 const jokerRoleText = assignment.actsAsColor
                   ? `${assignment.actsAsNumber}${getColorIcon(assignment.actsAsColor)}`
                   : `${assignment.actsAsNumber}`;
+                const jokerNote = option.source === "table"
+                  ? `${groupIndex + 1}번 줄의 조커 ${jokerRoleText} 역할을 ${replacementLabel}로 치환해 다른 줄에 재활용하세요.`
+                  : `${groupIndex + 1}번 줄의 조커 ${jokerRoleText} 역할을 ${replacementLabel}로 대체하고 다른 줄에 재사용하세요.`;
 
                 const candidate = this.createRearrangedState(state, ctx, {
                   mode: "joker-sub",
                   sourceGroupIndices,
-                  sourceTableIds: [jokerTile.id, ...plan.removedTiles.map(tile => tile.id)],
-                  sourceRackIds: [replacement.id, ...subset.ids],
-                  retainedGroups: [substitutedGroup, ...plan.remainingGroups],
+                  sourceTableIds,
+                  sourceRackIds,
+                  retainedGroups,
                   createdGroups: partition.groups,
                   detailText,
                   jokerAssignments: partition.groups.flatMap(createdGroup => RummyRules.explainGroup(createdGroup).jokerAssignments || []),
-                  jokerNote: `${groupIndex + 1}번 줄의 조커 ${jokerRoleText} 역할을 ${formatTileText(replacement)}로 치환하고 다른 줄에 재활용하세요.`,
+                  jokerNote,
                   statBoost: {
                     jokerRelocationCount: 1,
                     jokerEfficiency: Math.max(2, 6 - (subset.size + plan.removedTiles.length)),
@@ -1478,197 +1526,3 @@ class AIBaseStrategy {
     return this.dedupeAndSortCandidates(buckets, ctx, this.config.maxRearrangeBranches);
   }
 }
-
-AIBaseStrategy.prototype.canFinishTurn = function(state, ctx) {
-  const cacheKey = this.getSearchStateKey(state);
-  if (ctx.finishableCache.has(cacheKey)) {
-    return ctx.finishableCache.get(cacheKey);
-  }
-
-  const reducedDuringSearch = state.rack.length < ctx.initialRackSize;
-  const reducedEarlierThisTurn = !!(
-    ctx.gameState.hintMode
-    && (
-      ctx.gameState.alreadyReducedRackThisTurn
-      || (
-        Number.isInteger(ctx.gameState.turnStartRackSize)
-        && ctx.gameState.turnStartRackSize > ctx.initialRackSize
-      )
-    )
-  );
-  if (!reducedDuringSearch && !reducedEarlierThisTurn) {
-    ctx.finishableCache.set(cacheKey, false);
-    return false;
-  }
-  if (state.table.some(group => !RummyRules.analyzeGroup(group).valid)) {
-    ctx.finishableCache.set(cacheKey, false);
-    return false;
-  }
-
-  const { ruleOptions, currentPlayer } = ctx.gameState;
-  if (!ruleOptions.initial30 || currentPlayer.opened) {
-    ctx.finishableCache.set(cacheKey, true);
-    return true;
-  }
-
-  const openingGroups = state.table.slice(state.baseTableCount);
-  const finishable = isInitialOpenSatisfied(openingGroups);
-  ctx.finishableCache.set(cacheKey, finishable);
-  return finishable;
-};
-
-AIBaseStrategy.prototype.generateJokerSubstitutionMoves = function(state, ctx) {
-  const candidates = [];
-  const maxSolutions = this.config.maxPartitionSolutionsBridge || this.config.maxPartitionSolutions || 4;
-
-  for (let groupIndex = 0; groupIndex < state.table.length; groupIndex += 1) {
-    if (this.isTimedOut(ctx)) break;
-    const group = state.table[groupIndex];
-    const sourceAnalysis = RummyRules.explainGroup(group);
-    if (!sourceAnalysis.valid || !sourceAnalysis.jokerAssignments || sourceAnalysis.jokerAssignments.length === 0) continue;
-
-    for (const assignment of sourceAnalysis.jokerAssignments) {
-      if (this.isTimedOut(ctx)) break;
-      const jokerTile = group.find(tile => tile.id === assignment.tileId);
-      if (!jokerTile) continue;
-
-      const isExactReplacementTile = tile =>
-        !tile.joker
-        && tile.number === assignment.actsAsNumber
-        && (!assignment.actsAsColor || tile.color === assignment.actsAsColor);
-      const replacementOptions = state.rack
-        .filter(isExactReplacementTile)
-        .map(tile => ({
-          source: "rack",
-          tile,
-          donorGroupIndex: null,
-          donorRemainingGroups: []
-        }));
-
-      if ((this.config.maxTouchedGroups || 1) >= 2) {
-        for (let otherIndex = 0; otherIndex < state.table.length; otherIndex += 1) {
-          if (otherIndex === groupIndex) continue;
-          const donorPlans = this.getRemovalPlans(state.table[otherIndex], ctx, {
-            maxRemove: 1,
-            maxSolutions: 4,
-            allowZero: false
-          });
-          donorPlans.forEach(plan => {
-            if (plan.removedTiles.length !== 1) return;
-            const donorTile = plan.removedTiles[0];
-            if (!isExactReplacementTile(donorTile)) return;
-            replacementOptions.push({
-              source: "table",
-              tile: donorTile,
-              donorGroupIndex: otherIndex,
-              donorRemainingGroups: deepCopy(plan.remainingGroups)
-            });
-          });
-        }
-      }
-
-      for (const option of replacementOptions) {
-        if (this.isTimedOut(ctx)) break;
-        const replacement = option.tile;
-        const substitutedGroup = normalizeGroupTiles(
-          group
-            .filter(tile => tile.id !== jokerTile.id)
-            .concat(replacement)
-        );
-        const substitutedAnalysis = RummyRules.explainGroup(substitutedGroup);
-        if (!substitutedAnalysis.valid) continue;
-
-        const externalPlans = [{
-          groupIndex: null,
-          removedTiles: [],
-          remainingGroups: []
-        }];
-        if (option.source === "rack" && (this.config.maxTouchedGroups || 1) >= 2) {
-          for (let otherIndex = 0; otherIndex < state.table.length; otherIndex += 1) {
-            if (otherIndex === groupIndex) continue;
-            const plans = this.getRemovalPlans(state.table[otherIndex], ctx, {
-              maxRemove: this.config.maxRemovedPerGroup || 1,
-              maxSolutions: 2,
-              allowZero: false
-            });
-            plans.forEach(plan => {
-              if (plan.removedTiles.length === 0) return;
-              externalPlans.push({
-                groupIndex: otherIndex,
-                removedTiles: plan.removedTiles,
-                remainingGroups: plan.remainingGroups
-              });
-            });
-          }
-        }
-
-        for (const plan of externalPlans) {
-          if (this.isTimedOut(ctx)) break;
-          const seedTableTiles = [jokerTile, ...plan.removedTiles];
-          const rackSubsets = this.getRearrangementRackSubsets(state, ctx, seedTableTiles)
-            .filter(subset => !subset.ids.includes(replacement.id));
-
-          for (const subset of rackSubsets) {
-            if (this.isTimedOut(ctx)) break;
-            const pool = [jokerTile, ...plan.removedTiles, ...subset.tiles];
-            if (pool.length < 3 || pool.length > (this.config.maxPoolTiles || 10)) continue;
-
-            const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
-              maxSolutions,
-              ctx
-            });
-
-            partitions.slice(0, maxSolutions).forEach(partition => {
-              if (!partition.groups.some(createdGroup => createdGroup.some(tile => tile.id === jokerTile.id))) return;
-
-              const replacementLabel = option.source === "table"
-                ? `${(option.donorGroupIndex || 0) + 1}번 줄의 ${formatTileText(replacement)}`
-                : `손패 ${formatTileText(replacement)}`;
-              const sourceGroupIndices = option.source === "table"
-                ? [groupIndex, option.donorGroupIndex]
-                : (plan.groupIndex === null ? [groupIndex] : [groupIndex, plan.groupIndex]);
-              const sourceTableIds = option.source === "table"
-                ? [jokerTile.id, replacement.id]
-                : [jokerTile.id, ...plan.removedTiles.map(tile => tile.id)];
-              const sourceRackIds = option.source === "table"
-                ? [...subset.ids]
-                : [replacement.id, ...subset.ids];
-              const retainedGroups = option.source === "table"
-                ? [substitutedGroup, ...deepCopy(option.donorRemainingGroups)]
-                : [substitutedGroup, ...plan.remainingGroups];
-              const detailText = option.source === "table"
-                ? `${groupIndex + 1}번 줄의 조커를 ${replacementLabel}로 대체하고, 해방된 조커를 다시 활용하세요.`
-                : `${groupIndex + 1}번 줄의 조커를 ${replacementLabel}로 대체하고, 해방된 조커로 새 줄을 만드세요.`;
-              const jokerRoleText = assignment.actsAsColor
-                ? `${assignment.actsAsNumber}${getColorIcon(assignment.actsAsColor)}`
-                : `${assignment.actsAsNumber}`;
-              const jokerNote = option.source === "table"
-                ? `${groupIndex + 1}번 줄의 조커 ${jokerRoleText} 역할을 ${replacementLabel}로 치환해 다른 줄에 재활용하세요.`
-                : `${groupIndex + 1}번 줄의 조커 ${jokerRoleText} 역할을 ${replacementLabel}로 대체하고 다른 줄에 재사용하세요.`;
-
-              const candidate = this.createRearrangedState(state, ctx, {
-                mode: "joker-sub",
-                sourceGroupIndices,
-                sourceTableIds,
-                sourceRackIds,
-                retainedGroups,
-                createdGroups: partition.groups,
-                detailText,
-                jokerAssignments: partition.groups.flatMap(createdGroup => RummyRules.explainGroup(createdGroup).jokerAssignments || []),
-                jokerNote,
-                statBoost: {
-                  jokerRelocationCount: 1,
-                  jokerEfficiency: Math.max(2, 6 - (subset.size + plan.removedTiles.length)),
-                  jokerTrap: partition.groups.some(createdGroup => createdGroup.length === 3) ? 1 : 0
-                }
-              });
-              if (candidate) candidates.push(candidate);
-            });
-          }
-        }
-      }
-    }
-  }
-
-  return candidates;
-};

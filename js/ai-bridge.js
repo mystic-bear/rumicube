@@ -91,7 +91,6 @@ class AIBridge {
       if (pending.lastPartial) {
         const entry = this._clearPendingEntry(id);
         if (!entry) return;
-        entry.resolvedFromPartial = true;
         entry.resolve({
           ...entry.lastPartial,
           timedOut: true
@@ -106,7 +105,43 @@ class AIBridge {
 
   _cachePartial(pending, payload) {
     if (!pending || !payload) return;
-    pending.lastPartial = payload;
+    const searchPhase = payload.searchPhase
+      || payload.move?.searchPhase
+      || payload.hint?.searchPhase
+      || null;
+    const partialReason = payload.partialReason
+      || payload.move?.partialReason
+      || payload.hint?.partialReason
+      || "soft-deadline";
+    const partial = {
+      stateVersion: payload.stateVersion ?? pending.stateVersion,
+      partial: true,
+      searchTruncated: true,
+      searchPhase,
+      partialReason
+    };
+
+    if (payload.move) {
+      partial.move = {
+        ...payload.move,
+        partial: true,
+        searchTruncated: true,
+        searchPhase: payload.move.searchPhase || searchPhase,
+        partialReason: payload.move.partialReason || partialReason
+      };
+    }
+
+    if (payload.hint) {
+      partial.hint = {
+        ...payload.hint,
+        partial: true,
+        searchTruncated: true,
+        searchPhase: payload.hint.searchPhase || searchPhase,
+        partialReason: payload.hint.partialReason || partialReason
+      };
+    }
+
+    pending.lastPartial = partial;
   }
 
   _initWorker() {
@@ -202,16 +237,15 @@ class AIBridge {
   }
 
   _createPendingEntry(id, type, stateVersion, resolve, reject) {
-    return {
-      resolve,
-      reject,
-      timeoutHandle: this._startRequestTimeout(id, type),
-      type,
-      stateVersion,
-      lastPartial: null,
-      progressMeta: null,
-      resolvedFromPartial: false
-    };
+      return {
+        resolve,
+        reject,
+        timeoutHandle: this._startRequestTimeout(id, type),
+        type,
+        stateVersion,
+        lastPartial: null,
+        progressMeta: null
+      };
   }
 
   chooseMove(gameState, aiLevel, stateVersion) {
