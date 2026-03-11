@@ -248,10 +248,20 @@ const ui = {
     document.getElementById("info-text")[allowHtml ? "innerHTML" : "innerText"] = text;
   },
   showHint(hint) {
-    const parts = [
-      `<div class="hint-summary">${hint.leadText}</div>`,
-      `<div class="hint-reason">${hint.reason}</div>`
-    ];
+    const parts = [];
+    const labelParts = [hint.shortText, hint.summary]
+      .filter(Boolean)
+      .filter((value, index, list) => list.indexOf(value) === index);
+
+    if (labelParts.length > 0) {
+      parts.push(`<div class="hint-summary">${labelParts.join(" · ")}</div>`);
+    }
+    if (hint.leadText) {
+      parts.push(`<div class="hint-summary">${hint.leadText}</div>`);
+    }
+    if (hint.reason) {
+      parts.push(`<div class="hint-reason">${hint.reason}</div>`);
+    }
     if (hint.openingBreakdown && hint.openingBreakdown.length > 0) {
       parts.push(`<div class="hint-reason">${hint.openingBreakdown.join("<br>")}</div>`);
     }

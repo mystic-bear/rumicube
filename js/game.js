@@ -799,6 +799,81 @@ Game.prototype.applyAiMove = function(move, playerIndex) {
   this.scheduleTurnAdvance(700);
 };
 
+Game.prototype.presentHint = function(hint, toastMessage, consumeHint = true) {
+  if (consumeHint && this.currentPlayer.hintsRemaining !== null) {
+    this.currentPlayer.hintsRemaining = Math.max(0, this.currentPlayer.hintsRemaining - 1);
+  }
+
+  this.lastHint = hint;
+  ui.showHint(hint);
+  ui.updateAll();
+
+  if (toastMessage) {
+    ui.toast(toastMessage);
+  }
+};
+
+Game.prototype.getHintToastMessage = function(hint) {
+  if (hint.systemUnavailable) {
+    return hint.toastMessage || "AI 워커 연결이 없어 힌트를 만들 수 없습니다.";
+  }
+
+  if (hint.hintSource === "no-move") {
+    if (hint.moveType === "draw") return "둘 수 있는 유효한 수가 없어 1장 드로우를 권장합니다.";
+    if (hint.moveType === "end-turn") return "추가 유효 수가 없어 현재 배치 확정을 권장합니다.";
+    if (hint.moveType === "undo") return "추가 유효 수가 없어 되돌린 뒤 다시 정리가 필요합니다.";
+  }
+
+  if (hint.hintSource === "strategic-draw") {
+    if (hint.moveType === "draw") return `${hint.shortText || hint.summary || "전략 드로우"}를 권장합니다.`;
+    if (hint.moveType === "undo-draw") return "전략 드로우를 위해 되돌린 뒤 드로우를 권장합니다.";
+    if (hint.moveType === "end-turn") return "전략 드로우 차선으로 현재 배치 확정을 권장합니다.";
+    if (hint.moveType === "undo") return "전략 드로우를 위해 되돌린 뒤 다시 판단하세요.";
+  }
+
+  if (hint.engineMissFallback) return "현재 탐색 범위에서는 추가 수를 찾지 못했습니다.";
+  if (hint.moveType === "draw") return "이번 턴 추천은 드로우입니다.";
+  if (hint.moveType === "undo-draw") return "되돌린 뒤 드로우를 권장합니다.";
+  if (hint.moveType === "end-turn") return "턴 종료를 권장합니다.";
+  if (hint.moveType === "undo") return "무르기나 추가 배치가 필요합니다.";
+  return "추천 대상과 줄을 강조했습니다.";
+};
+
+Game.prototype.buildHintUnavailableHint = function(error) {
+  const code = error?.code || "worker-unavailable";
+  const reason = code === "hint-timeout"
+    ? "힌트 계산이 시간 초과되어 AI 워커를 다시 시작했습니다."
+    : code === "worker-crashed"
+      ? "AI 워커가 중단되어 이번 힌트를 계산할 수 없습니다."
+      : code === "worker-init-failed"
+        ? "AI 워커를 시작하지 못해 힌트 엔진을 사용할 수 없습니다."
+        : "AI 워커와 연결되지 않아 이번 힌트를 계산할 수 없습니다.";
+
+  return {
+    title: "힌트 생성 실패",
+    summary: "워커 연결 실패",
+    shortText: "힌트 엔진 오프라인",
+    leadText: "AI 워커 연결 문제로 힌트를 생성할 수 없습니다.",
+    reason,
+    moveType: "unavailable",
+    score: 0,
+    rackTileIds: [],
+    tableTileIds: [],
+    targetGroupIndices: [],
+    steps: [
+      "잠시 뒤 힌트 버튼을 다시 눌러보세요.",
+      "문제가 반복되면 메뉴로 나갔다가 다시 시작하세요."
+    ],
+    openingScore: 0,
+    hintSource: "worker-unavailable",
+    engineMissFallback: false,
+    systemUnavailable: true,
+    toastMessage: code === "hint-timeout"
+      ? "힌트 요청이 오래 걸려 AI 워커를 다시 시작했습니다."
+      : "AI 워커 연결이 없어 힌트를 만들 수 없습니다."
+  };
+};
+
 Game.prototype.applyHint = function(hint) {
   const hasAction = this.actionHistory.length > 0;
 
@@ -1046,6 +1121,131 @@ Game.prototype.requestHint = async function() {
     if (error.message === "Cancelled") return;
     console.error("Hint worker error:", error);
     ui.toast("힌트를 생성하지 못했습니다.");
+  } finally {
+    this.finishInputLockSession(session);
+  }
+};
+
+Game.prototype.applyHint = function(hint) {
+  const hasAction = this.actionHistory.length > 0;
+
+  if (hasAction && hint.moveType === "draw" && hint.hintSource === "strategic-draw" && !this.hasReducedRackThisTurn()) {
+    hint.title = hint.title || "AI-6 힌트";
+    hint.rackTileIds = [];
+    hint.tableTileIds = [];
+    hint.targetGroupIndices = [];
+    hint.summary = "되돌린 뒤 1장 뽑기";
+    hint.shortText = "되돌린 뒤 드로우";
+    hint.leadText = "추천: 지금 배치를 유지하기보다 되돌린 뒤 1장을 뽑는 편이 낫습니다.";
+    hint.reason = `${hint.reason || "현재 배치보다 드로우 선택이 더 낫습니다."} 이번 배치를 되돌린 뒤 1장을 뽑으세요.`;
+    hint.steps = [
+      "무르기 버튼으로 현재 배치를 되돌리세요.",
+      "1장 뽑기 버튼을 눌러 턴을 진행하세요."
+    ];
+    hint.moveType = "undo-draw";
+  } else if (hasAction && hint.moveType === "draw" && hint.hintSource === "strategic-draw") {
+    const allValid = this.workingTable.every(group =>
+      group.length === 0 || RummyRules.analyzeGroup(group).valid
+    );
+    hint.title = hint.title || "AI-6 힌트";
+    hint.rackTileIds = [];
+    hint.tableTileIds = [];
+    hint.targetGroupIndices = [];
+    if (allValid) {
+      hint.summary = "현재 배치 확정";
+      hint.shortText = "전략 드로우 차선";
+      hint.leadText = "추천: 원래는 드로우 판단이 더 좋았지만, 지금은 현재 배치를 확정하는 편이 낫습니다.";
+      hint.reason = "이번 턴 초반에는 드로우가 더 좋았지만 이미 손패를 줄여 드로우로 되돌리기 어렵습니다. 현재 배치를 확정하세요.";
+      hint.steps = ["턴 종료 버튼을 눌러 현재 배치를 확정하세요."];
+      hint.moveType = "end-turn";
+    } else {
+      hint.summary = "되돌리기";
+      hint.shortText = "전략 드로우 재선택";
+      hint.leadText = "추천: 현재 배치가 유효하지 않습니다. 되돌린 뒤 다시 판단하세요.";
+      hint.reason = "이 상황은 전략 드로우가 더 나았지만 현재 배치가 유효하지 않아 그대로 끝낼 수 없습니다. 되돌린 뒤 다시 선택하세요.";
+      hint.steps = [
+        "무르기 버튼으로 현재 배치를 되돌리세요.",
+        "다시 손을 보고 턴을 정리하세요."
+      ];
+      hint.moveType = "undo";
+    }
+  } else if (hasAction && hint.moveType === "draw" && hint.hintSource === "no-move") {
+    const allValid = this.workingTable.every(group =>
+      group.length === 0 || RummyRules.analyzeGroup(group).valid
+    );
+    hint.title = hint.title || "AI-6 힌트";
+    hint.rackTileIds = [];
+    hint.tableTileIds = [];
+    hint.targetGroupIndices = [];
+    if (allValid) {
+      hint.summary = "유효 수 없음";
+      hint.shortText = "유효 수 없음 · 현재 배치 확정";
+      hint.leadText = "현재 배치는 유효합니다. 추가로 둘 수 있는 유효한 수를 찾지 못했습니다.";
+      hint.reason = "현재 탐색 범위에서는 추가 유효 수를 찾지 못해 현재 배치 확정을 권장합니다.";
+      hint.steps = ["턴 종료 버튼을 눌러 현재 배치를 확정하세요."];
+      hint.moveType = "end-turn";
+    } else {
+      hint.summary = "유효 수 없음";
+      hint.shortText = "유효 수 없음 · 되돌리기";
+      hint.leadText = "추가로 둘 수 있는 유효한 수를 찾지 못했고, 현재 배치에는 유효하지 않은 줄이 남아 있습니다.";
+      hint.reason = "현재 탐색 범위에서는 추가 유효 수를 찾지 못했습니다. 지금 배치를 그대로 둘 수 없으니 되돌린 뒤 다시 정리하세요.";
+      hint.steps = [
+        "무르기 버튼으로 현재 배치를 되돌리세요.",
+        "직접 추가 수를 배치해 모든 줄을 유효하게 만드세요."
+      ];
+      hint.moveType = "undo";
+    }
+  } else if (!hasAction && hint.moveType === "draw" && hint.hintSource === "no-move") {
+    hint.title = hint.title || "AI-6 힌트";
+    hint.summary = "유효 수 없음";
+    hint.shortText = "유효 수 없음 · 1장 드로우";
+    hint.leadText = "추천: 지금은 둘 수 있는 유효한 수가 없어 1장을 뽑는 편이 낫습니다.";
+  }
+
+  this.presentHint(hint, this.getHintToastMessage(hint), true);
+};
+
+Game.prototype.requestHint = async function() {
+  if (this.gameOver || !this.currentPlayer || this.currentPlayer.type !== "HUMAN") return;
+  if (this.drewTileThisTurn) {
+    ui.toast("1장을 뽑은 뒤에는 힌트 대신 턴 종료만 할 수 있습니다.");
+    return;
+  }
+  if (!this.canUseHint()) {
+    ui.toast("사용 가능한 힌트가 없습니다.");
+    return;
+  }
+
+  const currentVersion = this.stateVersion;
+  const gameState = this.buildGameStateForAI({ hintMode: true });
+  const bridge = typeof window !== "undefined" ? window.aiBridge : null;
+  const session = this.startInputLockSession();
+
+  if (!gameState.tileTracker) {
+    gameState.tileTracker = this.buildTileTracker(this.turn);
+  }
+
+  if (!bridge) {
+    this.finishInputLockSession(session);
+    const unavailableHint = this.buildHintUnavailableHint(null);
+    this.presentHint(unavailableHint, this.getHintToastMessage(unavailableHint), false);
+    return;
+  }
+
+  ui.setInfo("힌트 분석 중", "AI가 현재 상황을 분석하고 있습니다...");
+
+  try {
+    const result = await bridge.getHint(gameState, currentVersion);
+
+    if (session.epoch !== this.asyncEpoch) return;
+    if (result.stateVersion !== this.stateVersion) return;
+
+    this.applyHint(result.hint);
+  } catch (error) {
+    if (error.message === "Cancelled") return;
+    console.error("Hint worker error:", error);
+    const unavailableHint = this.buildHintUnavailableHint(error);
+    this.presentHint(unavailableHint, this.getHintToastMessage(unavailableHint), false);
   } finally {
     this.finishInputLockSession(session);
   }

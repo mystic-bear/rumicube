@@ -13,6 +13,13 @@ class AIBridge {
     this._initWorker();
   }
 
+  _createBridgeError(message, code = "worker-unavailable", cause = null) {
+    const error = message instanceof Error ? message : new Error(String(message || "Worker unavailable"));
+    if (!error.code) error.code = code;
+    if (cause && !error.cause) error.cause = cause;
+    return error;
+  }
+
   _teardownWorker() {
     if (!this.worker) return;
     this.worker.onmessage = null;
@@ -24,7 +31,7 @@ class AIBridge {
   _markUnavailable(error) {
     this.ready = false;
     this.available = false;
-    this.lastError = error instanceof Error ? error : new Error(String(error || "Worker unavailable"));
+    this.lastError = this._createBridgeError(error, error?.code || "worker-unavailable");
   }
 
   _clearPendingEntry(id) {
@@ -36,7 +43,7 @@ class AIBridge {
   }
 
   _rejectAllPending(error) {
-    const workerError = error instanceof Error ? error : new Error(String(error || "Worker unavailable"));
+    const workerError = this._createBridgeError(error, error?.code || "worker-unavailable");
     this.pending.forEach((pending, id) => {
       const entry = this._clearPendingEntry(id);
       if (!entry) return;
@@ -45,7 +52,7 @@ class AIBridge {
   }
 
   _restartWorker(error) {
-    const workerError = error instanceof Error ? error : new Error(String(error || "Worker unavailable"));
+    const workerError = this._createBridgeError(error, error?.code || "worker-unavailable");
     this._rejectAllPending(workerError);
     this._teardownWorker();
     this._markUnavailable(workerError);
@@ -60,7 +67,8 @@ class AIBridge {
     return setTimeout(() => {
       if (!this.pending.has(id)) return;
       const label = type === "chooseMove" ? "AI move" : "Hint";
-      const error = new Error(`${label} request timed out`);
+      const code = type === "chooseMove" ? "choose-move-timeout" : "hint-timeout";
+      const error = this._createBridgeError(`${label} request timed out`, code);
       console.error(error.message);
       this._restartWorker(error);
     }, this._getRequestTimeoutMs(type));
@@ -73,7 +81,7 @@ class AIBridge {
       this.worker = new Worker(this.workerPath);
     } catch (error) {
       console.error("AI Worker unavailable:", error);
-      this._markUnavailable(error);
+      this._markUnavailable(this._createBridgeError(error, "worker-init-failed"));
       return false;
     }
 
@@ -109,7 +117,7 @@ class AIBridge {
 
     this.worker.onerror = (event) => {
       console.error("AI Worker crashed:", event);
-      this._restartWorker(new Error("Worker crashed"));
+      this._restartWorker(this._createBridgeError("Worker crashed", "worker-crashed", event));
     };
 
     return true;
@@ -120,9 +128,9 @@ class AIBridge {
     return this._initWorker();
   }
 
-  _getWorkerError(defaultMessage = "Worker unavailable") {
+  _getWorkerError(defaultMessage = "Worker unavailable", code = "worker-unavailable") {
     if (this.lastError instanceof Error) return this.lastError;
-    return new Error(defaultMessage);
+    return this._createBridgeError(defaultMessage, code);
   }
 
   _createRequestId(prefix) {
@@ -133,7 +141,7 @@ class AIBridge {
     const id = this._createRequestId("move");
     return new Promise((resolve, reject) => {
       if (!this._ensureWorker()) {
-        reject(this._getWorkerError("Worker unavailable"));
+        reject(this._getWorkerError("Worker unavailable", "worker-unavailable"));
         return;
       }
 
@@ -154,7 +162,7 @@ class AIBridge {
     const id = this._createRequestId("hint");
     return new Promise((resolve, reject) => {
       if (!this._ensureWorker()) {
-        reject(this._getWorkerError("Worker unavailable"));
+        reject(this._getWorkerError("Worker unavailable", "worker-unavailable"));
         return;
       }
 
@@ -179,6 +187,7 @@ class AIBridge {
 
 function createUnavailableAIBridge(error) {
   const lastError = error instanceof Error ? error : new Error(String(error || "Worker unavailable"));
+  if (!lastError.code) lastError.code = "worker-unavailable";
 
   return {
     worker: null,
