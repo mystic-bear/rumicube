@@ -64,19 +64,32 @@ self.onmessage = function(event) {
     softDeadlineMs,
     softDeadlineAt,
     allowPartial: allowPartial !== false,
+    includeDebug: !!gameState?.aiDebug,
     reporter
   };
 
   try {
     if (type === "chooseMove") {
-      const move = RummyAI.chooseMove(gameState, aiLevel, options);
-      self.postMessage({ type: "moveResult", id, stateVersion, move });
+      const result = RummyAI.chooseMove(gameState, aiLevel, options);
+      const move = result && typeof result === "object" && Object.prototype.hasOwnProperty.call(result, "move")
+        ? result.move
+        : result;
+      const debugStats = result && typeof result === "object" && Object.prototype.hasOwnProperty.call(result, "debugStats")
+        ? result.debugStats
+        : null;
+      self.postMessage({ type: "moveResult", id, stateVersion, move, debugStats });
       return;
     }
 
     if (type === "getHint") {
-      const hint = RummyHintEngine.getHint(gameState, options);
-      self.postMessage({ type: "hintResult", id, stateVersion, hint });
+      const result = RummyHintEngine.getHint(gameState, options);
+      const hint = result && typeof result === "object" && Object.prototype.hasOwnProperty.call(result, "hint")
+        ? result.hint
+        : result;
+      const debugStats = result && typeof result === "object" && Object.prototype.hasOwnProperty.call(result, "debugStats")
+        ? result.debugStats
+        : null;
+      self.postMessage({ type: "hintResult", id, stateVersion, hint, debugStats });
     }
   } catch (error) {
     self.postMessage({

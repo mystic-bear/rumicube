@@ -1,4 +1,51 @@
 class RummyAI {
+  static createDebugStats(gameState) {
+    const crowdedThreshold = 8;
+    return {
+      crowded: (gameState.table || []).length >= crowdedThreshold,
+      generated: { exact: 0, chain: 0 },
+      afterQuota: { exact: 0, chain: 0 },
+      afterReserve: { exact: 0, chain: 0 },
+      finishableSeen: { exact: 0, chain: 0 },
+      finalChosen: { exact: 0, chain: 0 },
+      nullReason: { noCandidates: 0, noFinishable: 0, softDeadline: 0 },
+      rejectReason: {
+        legacyFloor_exact: 0,
+        legacyFloor_chain: 0,
+        level6Floor_exact: 0,
+        level6Floor_chain: 0,
+        strategicDraw_exact: 0,
+        strategicDraw_chain: 0
+      },
+      topCandidateSeen: { exact: 0, chain: 0 },
+      _meta: {
+        anyCandidates: false,
+        anyFinishable: false,
+        softDeadline: false
+      }
+    };
+  }
+
+  static markDebugCount(debugStats, path, amount = 1) {
+    if (!debugStats || !path) return;
+    const segments = Array.isArray(path) ? path : String(path).split(".");
+    let current = debugStats;
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      const key = segments[index];
+      if (!current[key] || typeof current[key] !== "object") current[key] = {};
+      current = current[key];
+    }
+    const lastKey = segments[segments.length - 1];
+    current[lastKey] = (current[lastKey] || 0) + amount;
+  }
+
+  static exportDebugStats(debugStats) {
+    if (!debugStats) return null;
+    const exported = deepCopy(debugStats);
+    delete exported._meta;
+    return exported;
+  }
+
   static annotatePartialMove(move, phase = "search") {
     if (!move) return null;
     const annotated = deepCopy(move);
@@ -88,17 +135,24 @@ class RummyAI {
 
   static chooseMove(gameState, level, options = {}) {
     const targetLevel = Math.max(1, Math.min(6, Number(level) || 1));
+    const debugEnabled = !!gameState?.aiDebug;
+    const debugStats = options.debugStats || (debugEnabled ? this.createDebugStats(gameState) : null);
+    const nextOptions = {
+      ...options,
+      debugEnabled,
+      debugStats
+    };
     let chosen = null;
     if (targetLevel < 6) {
-      chosen = this.chooseLegacy(gameState, targetLevel, options);
+      chosen = this.chooseLegacy(gameState, targetLevel, nextOptions);
     } else {
       let bestLegacySoFar = null;
       let bestExpertSoFar = null;
       let bestChosenSoFar = null;
       let bestFinalSoFar = null;
-      const floorCache = this.getDispatcherFloorCache(options);
+      const floorCache = this.getDispatcherFloorCache(nextOptions);
       const floorCacheKey = this.getLegacyFloorCacheKey(gameState, 5);
-      const floorReporterOptions = this.createReporterProxy(options, {
+      const floorReporterOptions = this.createReporterProxy(nextOptions, {
         onProgress: (payload) => {
           if (payload?.kind === "move" && payload.move) {
             bestLegacySoFar = payload.move;
@@ -108,7 +162,7 @@ class RummyAI {
       });
       let floorMove = this.readCachedFloorMove(floorCache, floorCacheKey);
       if (!floorMove) {
-        if (this.getRemainingBudgetRatio(options) <= 0.4) {
+        if (this.getRemainingBudgetRatio(nextOptions) <= 0.4) {
           floorMove = this.getStrategy(5).chooseMove(gameState, floorReporterOptions);
           if (floorMove) {
             floorMove.engineLevel = 5;
@@ -123,13 +177,14 @@ class RummyAI {
         }
       }
       if (floorMove) bestLegacySoFar = floorMove;
-      if (this.isDeadlineReached(options)) {
-        return this.annotatePartialMove(bestLegacySoFar, floorMove?.searchPhase || "legacy-5");
+      if (this.isDeadlineReached(nextOptions)) {
+        const move = this.annotatePartialMove(bestLegacySoFar, floorMove?.searchPhase || "legacy-5");
+        return nextOptions.includeDebug ? { move, debugStats: this.exportDebugStats(debugStats) } : move;
       }
 
       const expertMove = this.getStrategy(6).chooseMove(
         gameState,
-        this.createReporterProxy(options, {
+        this.createReporterProxy(nextOptions, {
           onProgress: (payload) => {
             if (payload?.kind !== "move" || !payload.move) return payload;
             bestExpertSoFar = payload.move;
@@ -156,19 +211,29 @@ class RummyAI {
       } else if (!floorMove) {
         chosen = expertMove;
       } else {
-        chosen = this.passesLevel6Floor(expertMove, floorMove, gameState) ? expertMove : floorMove;
+        const passesFloor = this.passesLevel6Floor(expertMove, floorMove, gameState);
+        if (debugEnabled && !passesFloor) {
+          const type = this.getMoveDebugType(expertMove);
+          if (type) this.markDebugCount(debugStats, `rejectReason.level6Floor_${type}`);
+        }
+        chosen = passesFloor ? expertMove : floorMove;
       }
       bestChosenSoFar = chosen;
-      if (this.isDeadlineReached(options)) {
-        return this.annotatePartialMove(
+      if (this.isDeadlineReached(nextOptions)) {
+        const move = this.annotatePartialMove(
           bestChosenSoFar || bestLegacySoFar || bestExpertSoFar,
           chosen?.searchPhase || expertMove?.searchPhase || floorMove?.searchPhase || "dispatcher-l6"
         );
+        return nextOptions.includeDebug ? { move, debugStats: this.exportDebugStats(debugStats) } : move;
       }
 
       if (targetLevel >= 5) {
         const drawMove = this.chooseStrategicDraw(gameState, chosen, targetLevel);
         if (drawMove) {
+          if (debugEnabled) {
+            const type = this.getMoveDebugType(chosen);
+            if (type) this.markDebugCount(debugStats, `rejectReason.strategicDraw_${type}`);
+          }
           drawMove.engineLevel = targetLevel;
           drawMove.selectedLevel = targetLevel;
           bestFinalSoFar = drawMove;
@@ -179,25 +244,50 @@ class RummyAI {
 
       if (bestFinalSoFar) {
         chosen = bestFinalSoFar;
-      } else if (this.isDeadlineReached(options)) {
-        return this.annotatePartialMove(
+      } else if (this.isDeadlineReached(nextOptions)) {
+        const move = this.annotatePartialMove(
           bestFinalSoFar || bestChosenSoFar || bestLegacySoFar || bestExpertSoFar,
           chosen?.searchPhase || "dispatcher-l6"
         );
+        return nextOptions.includeDebug ? { move, debugStats: this.exportDebugStats(debugStats) } : move;
       }
     }
     if (chosen) chosen.selectedLevel = targetLevel;
 
     if (targetLevel >= 5 && targetLevel < 6) {
-      if (this.isDeadlineReached(options)) {
-        return this.annotatePartialMove(chosen, chosen?.searchPhase || `legacy-${targetLevel}`);
+      if (this.isDeadlineReached(nextOptions)) {
+        const move = this.annotatePartialMove(chosen, chosen?.searchPhase || `legacy-${targetLevel}`);
+        return nextOptions.includeDebug ? { move, debugStats: this.exportDebugStats(debugStats) } : move;
       }
       const drawMove = this.chooseStrategicDraw(gameState, chosen, targetLevel);
       if (drawMove) {
+        if (debugEnabled) {
+          const type = this.getMoveDebugType(chosen);
+          if (type) this.markDebugCount(debugStats, `rejectReason.strategicDraw_${type}`);
+        }
         drawMove.engineLevel = targetLevel;
         drawMove.selectedLevel = targetLevel;
-        return drawMove;
+        chosen = drawMove;
       }
+    }
+    if (debugEnabled && chosen) {
+      const finalType = this.getMoveDebugType(chosen);
+      if (finalType) this.markDebugCount(debugStats, `finalChosen.${finalType}`);
+    }
+    if (debugEnabled && !chosen) {
+      if (debugStats?._meta?.softDeadline || this.isDeadlineReached(nextOptions)) {
+        this.markDebugCount(debugStats, "nullReason.softDeadline");
+      } else if (debugStats?._meta?.anyCandidates) {
+        this.markDebugCount(debugStats, "nullReason.noFinishable");
+      } else {
+        this.markDebugCount(debugStats, "nullReason.noCandidates");
+      }
+    }
+    if (nextOptions.includeDebug) {
+      return {
+        move: chosen,
+        debugStats: this.exportDebugStats(debugStats)
+      };
     }
     return chosen;
   }
@@ -221,6 +311,10 @@ class RummyAI {
         && bestMove
         && !this.passesLegacyFloor(move, bestMove, gameState, currentLevel)
       ) {
+        if (options.debugEnabled) {
+          const type = this.getMoveDebugType(move);
+          if (type) this.markDebugCount(options.debugStats, `rejectReason.legacyFloor_${type}`);
+        }
         continue;
       }
       const comparison = this.compareMovePriority(move, bestMove, gameState);
@@ -313,6 +407,13 @@ class RummyAI {
       if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
     }
     return 0;
+  }
+
+  static getMoveDebugType(move) {
+    if (!move?.actions?.length) return null;
+    if (move.actions.some(action => action.mode === "chain-append")) return "chain";
+    if (move.actions.some(action => action.mode === "exact")) return "exact";
+    return null;
   }
 
   static isBetterMove(candidate, current, gameState) {

@@ -48,6 +48,9 @@ class AIBaseStrategy {
     }
 
     const finalBest = best || emergencyBest;
+    if (!completedAllPasses || ctx.truncatedReason) {
+      this.markSoftDeadline(ctx);
+    }
     if (!finalBest) return null;
     const move = this.buildMove(finalBest, ctx);
     if (!completedAllPasses || ctx.truncatedReason) {
@@ -93,6 +96,31 @@ class AIBaseStrategy {
   createSearchContext(gameState, initialState, options = {}) {
     const startedAt = Date.now();
     const fallbackDeadline = this.config.timeLimitMs ? startedAt + this.config.timeLimitMs : Infinity;
+    const crowdedThreshold = this.config.complexityCaps?.crowdedTableThreshold || 8;
+    const debugEnabled = !!gameState?.aiDebug;
+    const debugStats = options.debugStats || (debugEnabled ? {
+      crowded: initialState.table.length >= crowdedThreshold,
+      generated: { exact: 0, chain: 0 },
+      afterQuota: { exact: 0, chain: 0 },
+      afterReserve: { exact: 0, chain: 0 },
+      finishableSeen: { exact: 0, chain: 0 },
+      finalChosen: { exact: 0, chain: 0 },
+      nullReason: { noCandidates: 0, noFinishable: 0, softDeadline: 0 },
+      rejectReason: {
+        legacyFloor_exact: 0,
+        legacyFloor_chain: 0,
+        level6Floor_exact: 0,
+        level6Floor_chain: 0,
+        strategicDraw_exact: 0,
+        strategicDraw_chain: 0
+      },
+      topCandidateSeen: { exact: 0, chain: 0 },
+      _meta: {
+        anyCandidates: false,
+        anyFinishable: false,
+        softDeadline: false
+      }
+    } : null);
     return {
       gameState,
       startedAt,
@@ -101,6 +129,8 @@ class AIBaseStrategy {
       allowPartial: options.allowPartial !== false,
       reporter: options.reporter || null,
       truncatedReason: null,
+      debugEnabled,
+      debugStats,
       progressThrottleAt: 0,
       searchPhase: null,
       rackGroupCache: new Map(),
@@ -113,6 +143,40 @@ class AIBaseStrategy {
       initialTableSize: initialState.table.length,
       initialJokerCount: initialState.rack.filter(tile => tile.joker).length
     };
+  }
+
+  markDebugCount(ctx, path, amount = 1) {
+    if (!ctx?.debugEnabled || !ctx.debugStats || !path) return;
+    const segments = Array.isArray(path) ? path : String(path).split(".");
+    let current = ctx.debugStats;
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      const key = segments[index];
+      if (!current[key] || typeof current[key] !== "object") {
+        current[key] = {};
+      }
+      current = current[key];
+    }
+    const lastKey = segments[segments.length - 1];
+    current[lastKey] = (current[lastKey] || 0) + amount;
+  }
+
+  getCandidateDebugType(candidate) {
+    if (!candidate?.actions?.length) return null;
+    if (candidate.actions.some(action => action.mode === "chain-append")) return "chain";
+    if (candidate.actions.some(action => action.mode === "exact")) return "exact";
+    return null;
+  }
+
+  markCandidateType(ctx, candidate, bucket) {
+    const type = this.getCandidateDebugType(candidate);
+    if (!type) return null;
+    this.markDebugCount(ctx, `${bucket}.${type}`);
+    return type;
+  }
+
+  markSoftDeadline(ctx) {
+    if (!ctx?.debugEnabled || !ctx.debugStats?._meta) return;
+    ctx.debugStats._meta.softDeadline = true;
   }
 
   buildProgressMove(state, ctx, phase) {
@@ -175,9 +239,13 @@ class AIBaseStrategy {
       const nextFrontier = [];
       for (const state of frontier) {
         const candidates = this.generateCandidates(state, ctx);
+        if (ctx.debugEnabled && candidates.length > 0 && ctx.debugStats?._meta) {
+          ctx.debugStats._meta.anyCandidates = true;
+        }
         for (const candidate of candidates) {
           if (this.isTimedOut(ctx)) {
             ctx.truncatedReason = ctx.truncatedReason || "soft-deadline";
+            this.markSoftDeadline(ctx);
             completed = false;
             break;
           }
@@ -193,9 +261,14 @@ class AIBaseStrategy {
 
           candidate.evalScore = value;
           if (this.canFinishTurn(candidate, ctx)) {
+            if (ctx.debugEnabled && ctx.debugStats?._meta) {
+              ctx.debugStats._meta.anyFinishable = true;
+              this.markCandidateType(ctx, candidate, "finishableSeen");
+            }
             candidate.finalScore = this.evaluateState(candidate, ctx, true);
             if (!best || this.compareCandidateOrder(candidate, best, ctx, "finalScore") < 0) {
               best = candidate;
+              this.markCandidateType(ctx, candidate, "topCandidateSeen");
               this.reportProgress(ctx, {
                 kind: "move",
                 move: this.buildProgressMove(candidate, ctx, `beam-d${depth}`),
@@ -1196,6 +1269,9 @@ class AIBaseStrategy {
       }
     }
 
+    if (ctx.debugEnabled) {
+      candidates.forEach(candidate => this.markCandidateType(ctx, candidate, "generated"));
+    }
     return candidates;
   }
 
@@ -1586,6 +1662,12 @@ class AIBaseStrategy {
       if (continueDonorPlans === false) break;
     }
 
+    if (ctx.debugEnabled) {
+      candidates.forEach(candidate => this.markCandidateType(ctx, candidate, "generated"));
+    }
+    if (ctx.debugEnabled) {
+      candidates.forEach(candidate => this.markCandidateType(ctx, candidate, "generated"));
+    }
     return candidates;
   }
 
@@ -2003,6 +2085,9 @@ class AIBaseStrategy {
       }
     }
 
+    if (ctx.debugEnabled) {
+      candidates.forEach(candidate => this.markCandidateType(ctx, candidate, "generated"));
+    }
     return candidates;
   }
 
@@ -2038,6 +2123,9 @@ class AIBaseStrategy {
         ctx,
         this.config.chainAppendQuota ?? this.config.maxRearrangeBranches
       );
+      if (ctx.debugEnabled) {
+        chainCandidates.forEach(candidate => this.markCandidateType(ctx, candidate, "afterQuota"));
+      }
       const reserve = Math.max(0, this.config.chainAppendReserve || 0);
       reservedBuckets.push(
         ...chainCandidates
@@ -2066,18 +2154,26 @@ class AIBaseStrategy {
       ));
     }
     if (this.modeEnabled("exact")) {
-      buckets.push(...this.pickQuota(
+      const exactCandidates = this.pickQuota(
         this.generateExactCoverRearrangementMoves(state, ctx),
         ctx,
         this.config.exactQuota ?? this.config.maxRearrangeBranches
-      ));
+      );
+      if (ctx.debugEnabled) {
+        exactCandidates.forEach(candidate => this.markCandidateType(ctx, candidate, "afterQuota"));
+      }
+      buckets.push(...exactCandidates);
     }
 
-    return this.dedupeAndSortCandidatesWithReserve(
+    const finalMoves = this.dedupeAndSortCandidatesWithReserve(
       buckets,
       ctx,
       this.config.maxRearrangeBranches,
       reservedBuckets
     );
+    if (ctx.debugEnabled) {
+      finalMoves.forEach(candidate => this.markCandidateType(ctx, candidate, "afterReserve"));
+    }
+    return finalMoves;
   }
 }
