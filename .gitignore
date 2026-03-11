@@ -1,0 +1,11 @@
+full_code*.md
+
+backup/
+*.zip
+
+legacy/
+test/
+
+.DS_Store
+Thumbs.db
+.vscode/
