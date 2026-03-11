@@ -13,6 +13,53 @@ class RummyAI {
     return typeof options.softDeadlineAt === "number" && Date.now() >= options.softDeadlineAt;
   }
 
+  static getDispatcherFloorCache(options = {}) {
+    if (options.floorCache instanceof Map) return options.floorCache;
+    if (!this._floorCache) this._floorCache = new Map();
+    return this._floorCache;
+  }
+
+  static getLegacyFloorCacheKey(gameState, level = 5) {
+    const rackIds = (gameState.currentPlayer?.rack || [])
+      .map(tile => tile.id)
+      .sort((a, b) => a - b)
+      .join(",");
+    const tableSignature = typeof serializeTableState === "function"
+      ? serializeTableState(gameState.table || [])
+      : JSON.stringify(gameState.table || []);
+    return [
+      gameState.stateVersion ?? "na",
+      gameState.turnIndex ?? 0,
+      gameState.currentPlayer?.opened ? 1 : 0,
+      gameState.baseTableCount || 0,
+      rackIds,
+      tableSignature,
+      `level${level}-floor`
+    ].join("|");
+  }
+
+  static readCachedFloorMove(cache, key) {
+    if (!cache?.has(key)) return null;
+    return deepCopy(cache.get(key));
+  }
+
+  static writeCachedFloorMove(cache, key, move) {
+    if (!cache || !key || !move) return;
+    cache.set(key, deepCopy(move));
+    if (cache.size <= 24) return;
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      cache.delete(oldestKey);
+    }
+  }
+
+  static getRemainingBudgetRatio(options = {}) {
+    if (typeof options.softDeadlineAt !== "number" || typeof options.budgetMs !== "number" || options.budgetMs <= 0) {
+      return 1;
+    }
+    return Math.max(0, (options.softDeadlineAt - Date.now()) / options.budgetMs);
+  }
+
   static createReporterProxy(options = {}, handlers = {}) {
     const parentReporter = options.reporter || null;
     return {
@@ -49,18 +96,32 @@ class RummyAI {
       let bestExpertSoFar = null;
       let bestChosenSoFar = null;
       let bestFinalSoFar = null;
-      const floorMove = this.chooseLegacy(
-        gameState,
-        5,
-        this.createReporterProxy(options, {
-          onProgress: (payload) => {
-            if (payload?.kind === "move" && payload.move) {
-              bestLegacySoFar = payload.move;
-            }
-            return payload;
+      const floorCache = this.getDispatcherFloorCache(options);
+      const floorCacheKey = this.getLegacyFloorCacheKey(gameState, 5);
+      const floorReporterOptions = this.createReporterProxy(options, {
+        onProgress: (payload) => {
+          if (payload?.kind === "move" && payload.move) {
+            bestLegacySoFar = payload.move;
           }
-        })
-      );
+          return payload;
+        }
+      });
+      let floorMove = this.readCachedFloorMove(floorCache, floorCacheKey);
+      if (!floorMove) {
+        if (this.getRemainingBudgetRatio(options) <= 0.4) {
+          floorMove = this.getStrategy(5).chooseMove(gameState, floorReporterOptions);
+          if (floorMove) {
+            floorMove.engineLevel = 5;
+            floorMove.selectedLevel = 5;
+            floorMove.searchPhase = floorMove.searchPhase || "level5-fast-floor";
+          }
+        } else {
+          floorMove = this.chooseLegacy(gameState, 5, floorReporterOptions);
+        }
+        if (floorMove) {
+          this.writeCachedFloorMove(floorCache, floorCacheKey, floorMove);
+        }
+      }
       if (floorMove) bestLegacySoFar = floorMove;
       if (this.isDeadlineReached(options)) {
         return this.annotatePartialMove(bestLegacySoFar, floorMove?.searchPhase || "legacy-5");
@@ -744,6 +805,10 @@ RummyAI.estimateDrawEV = function(beforeDraw, gameState, bestMove, metrics, reas
 RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
   if (level < 5) return null;
   if (!bestMove || bestMove.type === "draw") return null;
+  if (bestMove.searchTruncated) return null;
+  if ((bestMove.stats?.chainAppendCount || 0) > 0) return null;
+  if ((bestMove.actions || []).some(action => action.mode === "exact")) return null;
+  if ((bestMove.openingScore || 0) >= 30) return null;
 
   const currentRackCount = gameState.currentPlayer.rack.length;
   if ((bestMove.rack || []).length === 0 || (bestMove.rackReduction || 0) >= currentRackCount) return null;
@@ -779,6 +844,7 @@ RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
   const fragileIncrease = Math.max(0, afterFragileGroups - beforeFragileGroups);
   const beforeFutureMobility = this.countAppendableRackTilesForDrawState(beforeState);
   const futureMobilityLoss = Math.max(0, beforeFutureMobility - (bestMove.futureMobility || 0));
+  if ((bestMove.futureMobility || 0) > beforeFutureMobility) return null;
 
   const metrics = {
     futureLoss,
@@ -819,7 +885,8 @@ RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
   };
   const chooseIfStrongEnough = (reasonCode, meta = {}) => {
     const estimate = this.estimateDrawEV(beforeDraw, gameState, bestMove, metrics, reasonCode, level);
-    if (estimate.totalEV < estimate.thresholdUsed) return null;
+    const thresholdBump = gameState.hintMode ? 8 : 0;
+    if (estimate.totalEV < estimate.thresholdUsed + thresholdBump) return null;
     return this.makeStrategicDrawMove(reasonCode, estimate.totalEV, level, {
       ...baseMeta,
       ...estimate,

@@ -126,6 +126,7 @@ class Game {
         type: player.type,
         aiLevel: player.aiLevel
       })),
+      stateVersion: this.stateVersion,
       turnIndex: this.turn,
       consecutiveStrategicDrawsByPlayer: [...this.consecutiveStrategicDrawsByPlayer],
       openingHoldDrawUsed: [...this.openingHoldDrawUsed]
@@ -660,6 +661,25 @@ Game.prototype.bumpStateVersion = function() {
   this.stateVersion = (this.stateVersion || 0) + 1;
 };
 
+Game.prototype.computeStateMutationFingerprint = function() {
+  const tableSignature = typeof serializeTableState === "function"
+    ? serializeTableState(this.workingTable || [])
+    : JSON.stringify(this.workingTable || []);
+  const currentRackIds = (this.currentPlayer?.rack || [])
+    .map(tile => tile.id)
+    .sort((a, b) => a - b)
+    .join(",");
+  return [
+    tableSignature,
+    currentRackIds,
+    this.turn ?? 0,
+    this.currentPlayer?.opened ? 1 : 0,
+    this.actionHistory?.length || 0,
+    this.bag?.length || 0,
+    this.drewTileThisTurn ? 1 : 0
+  ].join("|");
+};
+
 Game.prototype.setInputLock = function(locked, token = null) {
   if (locked) {
     if (token !== null) this.inputLockToken = token;
@@ -873,7 +893,7 @@ const wrapStateMutation = (methodName, options = {}) => {
   if (typeof original !== "function") return;
 
   Game.prototype[methodName] = function(...args) {
-    this.bumpStateVersion();
+    const beforeFingerprint = this.computeStateMutationFingerprint();
 
     if (options.cancelPending && typeof window !== "undefined" && window.aiBridge) {
       window.aiBridge.cancelPending();
@@ -883,7 +903,12 @@ const wrapStateMutation = (methodName, options = {}) => {
       this.invalidateAsyncState();
     }
 
-    return original.apply(this, args);
+    const result = original.apply(this, args);
+    const afterFingerprint = this.computeStateMutationFingerprint();
+    if (beforeFingerprint !== afterFingerprint) {
+      this.bumpStateVersion();
+    }
+    return result;
   };
 };
 
@@ -1027,6 +1052,13 @@ Game.prototype.applyHint = function(hint) {
     hint.shortText = "유효 수 없음 · 1장 드로우";
     hint.leadText = "추천: 지금은 둘 수 있는 유효한 수가 없어 1장을 뽑는 편이 낫습니다.";
     hint.engineMissFallback = true;
+  }
+
+  if (hint.searchTruncated && !hint.truncationNote) {
+    hint.truncationNote = "현재 탐색 범위 기준 최선안입니다.";
+  }
+  if (!Array.isArray(hint.steps)) {
+    hint.steps = [];
   }
 
   this.presentHint(hint, this.getHintToastMessage(hint), true);

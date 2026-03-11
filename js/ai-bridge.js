@@ -179,6 +179,8 @@ class AIBridge {
         this._cachePartial(pending, {
           move,
           stateVersion,
+          searchPhase: event.data.searchPhase || null,
+          partialReason: event.data.partialReason || null,
           partial: true,
           searchTruncated: true
         });
@@ -189,6 +191,8 @@ class AIBridge {
         this._cachePartial(pending, {
           hint,
           stateVersion,
+          searchPhase: event.data.searchPhase || null,
+          partialReason: event.data.partialReason || null,
           partial: true,
           searchTruncated: true
         });

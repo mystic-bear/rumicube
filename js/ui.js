@@ -249,6 +249,7 @@ const ui = {
   },
   showHint(hint) {
     const parts = [];
+    const steps = Array.isArray(hint.steps) ? hint.steps : [];
     if (hint.searchTruncated && hint.truncationNote) {
       parts.push(`<div class="hint-reason">${hint.truncationNote}</div>`);
     }
@@ -271,10 +272,10 @@ const ui = {
     if (hint.futureBenefit) {
       parts.push(`<div class="hint-reason">${hint.futureBenefit}</div>`);
     }
-    hint.steps.forEach((step, index) => {
+    steps.forEach((step, index) => {
       parts.push(`<div class="hint-step">${index + 1}. ${step}</div>`);
     });
-    this.setInfo(hint.title, parts.join(""), true);
+    this.setInfo(hint.title || "힌트", parts.join(""), true);
   },
 
   updateButtons() {

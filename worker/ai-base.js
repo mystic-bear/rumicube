@@ -105,6 +105,7 @@ class AIBaseStrategy {
       searchPhase: null,
       rackGroupCache: new Map(),
       poolGroupCache: new Map(),
+      protectedSubsetPoolCache: new Map(),
       transpositionTable: new Map(),
       finishableCache: new Map(),
       evalCache: new Map(),
@@ -296,6 +297,10 @@ class AIBaseStrategy {
     const caps = this.config.complexityCaps || {};
     const baseConfig = this.config;
     const effective = { ...baseConfig };
+    const strategyName = this.constructor?.name || "";
+    const isLevel5 = strategyName === "AILevel5Strategy";
+    const isLevel6 = strategyName === "AILevel6Strategy";
+    const isHintMode = !!ctx.gameState?.hintMode;
     const largeRackThreshold = caps.largeRackThreshold || 16;
     const veryLargeRackThreshold = caps.veryLargeRackThreshold || 20;
     const crowdedTableThreshold = caps.crowdedTableThreshold || 8;
@@ -306,10 +311,12 @@ class AIBaseStrategy {
     }
     if (state.rack.length >= veryLargeRackThreshold) {
       effective.maxRackSubsetBranches = Math.max(6, Math.floor((effective.maxRackSubsetBranches || 24) * 0.7));
-      effective.maxPoolTiles = Math.min(effective.maxPoolTiles || 12, 10);
+      const cappedPoolTiles = isLevel6 ? 12 : isLevel5 ? 11 : 10;
+      effective.maxPoolTiles = Math.min(effective.maxPoolTiles || cappedPoolTiles, cappedPoolTiles);
     }
     if (this.isOpeningPending(ctx) && !state.opened && state.rack.length >= unopenedLargeRackThreshold) {
-      if (typeof effective.exactQuota === "number") effective.exactQuota = Math.min(effective.exactQuota, 1);
+      const openingExactCap = isLevel5 || isLevel6 ? 2 : 1;
+      if (typeof effective.exactQuota === "number") effective.exactQuota = Math.min(effective.exactQuota, openingExactCap);
       if (typeof effective.advancedJokerChainQuota === "number") effective.advancedJokerChainQuota = 0;
       if (typeof effective.advancedJokerChainDoubleSupportQuota === "number") effective.advancedJokerChainDoubleSupportQuota = 0;
     }
@@ -319,12 +326,12 @@ class AIBaseStrategy {
       maxRecipientGroups: baseConfig.chainAppendMaxRecipientGroups || 1,
       maxFreeTableTiles: baseConfig.chainAppendMaxFreeTableTiles || baseConfig.chainAppendMaxFreedTiles || 4,
       maxRackSubsetSize: baseConfig.chainAppendMaxRackSubsetSize || 0,
-      maxNewGroups: baseConfig.chainAppendMaxNewGroups || 1,
       directOnly: baseConfig.chainAppendDirectOnly !== false,
       allowGapFill: !!baseConfig.chainAppendAllowGapFill,
       allowTwoTileSameRecipient: baseConfig.chainAppendAllowTwoTileSameRecipient !== false,
       maxRecipientExtensionsPerGroup: baseConfig.chainAppendMaxRecipientExtensionsPerGroup || 2,
-      minStructuralGain: baseConfig.chainAppendMinStructuralGain || 0
+      minStructuralGain: baseConfig.chainAppendMinStructuralGain || 0,
+      requireAllFreedTilesUsedOrRetained: !!baseConfig.chainAppendRequireAllFreedTilesUsedOrRetained
     };
     effective.generatorBudgets = {
       bridge: {
@@ -346,6 +353,8 @@ class AIBaseStrategy {
         2
       );
       const crowdedBudgets = baseConfig.crowdedBudgets || {};
+      const crowdedExactTouchedCap = isLevel6 && isHintMode ? 3 : 2;
+      const crowdedExactPartitionCap = isLevel6 ? 3 : 2;
       effective.generatorBudgets.bridge = {
         ...effective.generatorBudgets.bridge,
         maxTouchedGroups: crowdedBudgets.bridgeMaxTouchedGroups || 2,
@@ -353,8 +362,8 @@ class AIBaseStrategy {
       };
       effective.generatorBudgets.exact = {
         ...effective.generatorBudgets.exact,
-        maxTouchedGroups: crowdedBudgets.exactMaxTouchedGroups || 2,
-        maxPartitionSolutions: crowdedBudgets.exactMaxPartitionSolutions || 2
+        maxTouchedGroups: Math.max(crowdedBudgets.exactMaxTouchedGroups || 0, crowdedExactTouchedCap),
+        maxPartitionSolutions: Math.max(crowdedBudgets.exactMaxPartitionSolutions || 0, crowdedExactPartitionCap)
       };
       effective.generatorBudgets["chain-append"] = {
         ...effective.generatorBudgets["chain-append"],
@@ -577,25 +586,35 @@ class AIBaseStrategy {
         && nonJokers.every(tile => tile.color === nonJokers[0].color)
         && (Math.max(...nonJokers.map(tile => tile.number)) - Math.min(...nonJokers.map(tile => tile.number))) <= nonJokers.length + 2;
       const hasJoker = subset.tiles.some(tile => tile.joker);
+      if (subset.size === 1 && !hasJoker && !sameNumber && !nearRun) {
+        return [];
+      }
       let bridgeable = false;
       let jokerCompletable = false;
       let jokerReplaceable = false;
-        if (tableTiles.length > 0) {
+      if (tableTiles.length > 0) {
+        const poolCacheKey = `${subset.ids.join(",")}::${tableTiles.map(tile => tile.id).sort((a, b) => a - b).join(",")}::${tableTiles.length + subset.tiles.length}`;
+        let poolMeta = ctx.protectedSubsetPoolCache.get(poolCacheKey);
+        if (!poolMeta) {
           const pool = [...subset.tiles, ...tableTiles];
           const validGroups = RummyAIUtils.getValidGroupsFromTiles(pool, ctx.poolGroupCache, {
             maxSize: pool.length,
             ctx
           });
-        bridgeable = validGroups.some(group =>
-          subset.ids.every(id => group.ids.includes(id)) &&
-          group.ids.some(id => tableIds.has(id))
-        );
-        if (hasTableJoker) {
-          jokerCompletable = validGroups.some(group =>
-            subset.ids.every(id => group.ids.includes(id)) &&
-            group.ids.some(id => tableIds.has(id) && tableTiles.find(tile => tile.id === id)?.joker)
-          );
+          poolMeta = {
+            bridgeable: validGroups.some(group =>
+              subset.ids.every(id => group.ids.includes(id)) &&
+              group.ids.some(id => tableIds.has(id))
+            ),
+            jokerCompletable: hasTableJoker && validGroups.some(group =>
+              subset.ids.every(id => group.ids.includes(id)) &&
+              group.ids.some(id => tableIds.has(id) && tableTiles.find(tile => tile.id === id)?.joker)
+            )
+          };
+          ctx.protectedSubsetPoolCache.set(poolCacheKey, poolMeta);
         }
+        bridgeable = !!poolMeta.bridgeable;
+        jokerCompletable = !!poolMeta.jokerCompletable;
       }
 
       for (const group of state.table) {
@@ -1241,15 +1260,23 @@ class AIBaseStrategy {
     const maxConsume = options.allowTwoTileSameRecipient ? Math.min(2, freeTiles.length) : 1;
     const extensions = [];
 
-    const pushExtension = (consumedTiles, resultGroup, resultAnalysis, appendedOneSide = true) => {
+    const pushExtension = (consumedTiles, resultGroup, resultAnalysis, extensionType = "append", appendedOneSide = true) => {
+      const extensionBonus = extensionType === "gap-fill+append"
+        ? 10
+        : extensionType === "gap-fill"
+          ? 8
+          : appendedOneSide
+            ? 6
+            : 2;
       extensions.push({
         consumedTiles: deepCopy(consumedTiles),
         consumedIds: consumedTiles.map(tile => tile.id),
         resultGroup: normalizeGroupTiles(resultGroup),
         resultAnalysis,
+        extensionType,
         score: (resultAnalysis.score || 0)
           + consumedTiles.length * 20
-          + (appendedOneSide ? 6 : 2),
+          + extensionBonus,
         sameRecipientDouble: consumedTiles.length >= 2 ? 1 : 0
       });
     };
@@ -1267,6 +1294,13 @@ class AIBaseStrategy {
 
     if (isRunRecipient && analysis.canonicalNumbers.length === group.length) {
       const originalNumbers = analysis.canonicalNumbers;
+      const originalMin = Math.min(...originalNumbers);
+      const originalMax = Math.max(...originalNumbers);
+      const gapNumbers = new Set(
+        (analysis.jokerAssignments || [])
+          .map(assignment => assignment.actsAsNumber)
+          .filter(number => Number.isInteger(number) && number > originalMin && number < originalMax)
+      );
       for (let consumeCount = 1; consumeCount <= maxConsume; consumeCount += 1) {
         const completed = RummyAIUtils.generateKCombinations(freeTiles, consumeCount, options.ctx, (consumedTiles) => {
           const resultGroup = normalizeGroupTiles([...group, ...consumedTiles]);
@@ -1281,13 +1315,55 @@ class AIBaseStrategy {
 
           const addedFront = startIndex;
           const addedBack = resultNumbers.length - (startIndex + originalNumbers.length);
-          if ((addedFront + addedBack) !== consumeCount) return true;
-
           const appendedOneSide = addedFront === 0 || addedBack === 0;
-          if (options.directOnly && !appendedOneSide) return true;
-          if (!options.allowTwoTileSameRecipient && consumeCount > 1) return true;
+          const nonJokerConsumed = consumedTiles.filter(tile => !tile.joker);
+          const gapFillCount = nonJokerConsumed.filter(tile => gapNumbers.has(tile.number)).length;
+          const frontCount = nonJokerConsumed.filter(tile => tile.number < originalMin).length;
+          const backCount = nonJokerConsumed.filter(tile => tile.number > originalMax).length;
+          const invalidInternal = nonJokerConsumed.some(tile =>
+            tile.number >= originalMin
+            && tile.number <= originalMax
+            && !gapNumbers.has(tile.number)
+          );
+          if (options.allowGapFill && gapFillCount > 0) {
+            if (!options.allowTwoTileSameRecipient && consumeCount > 1) return true;
+            if (nonJokerConsumed.length !== consumedTiles.length) return true;
+            if (invalidInternal || gapFillCount !== 1) return true;
 
-          pushExtension(consumedTiles, resultGroup, resultAnalysis, appendedOneSide);
+            const edgeAppendCount = frontCount + backCount;
+            if (edgeAppendCount > 1) return true;
+            if (options.directOnly) return true;
+            if (edgeAppendCount === 1 && !appendedOneSide) return true;
+
+            const extensionType = edgeAppendCount === 1 ? "gap-fill+append" : "gap-fill";
+            pushExtension(consumedTiles, resultGroup, resultAnalysis, extensionType, true);
+            return true;
+          }
+
+          const directAppend = (addedFront + addedBack) === consumeCount;
+          if (directAppend) {
+            if (options.directOnly && !appendedOneSide) return true;
+            if (!options.allowTwoTileSameRecipient && consumeCount > 1) return true;
+            const extensionType = addedFront > 0 && addedBack > 0
+              ? "append-both"
+              : addedFront > 0
+                ? "append-front"
+                : "append-back";
+            pushExtension(consumedTiles, resultGroup, resultAnalysis, extensionType, appendedOneSide);
+            return true;
+          }
+
+          if (!options.allowGapFill) return true;
+
+          if (nonJokerConsumed.length !== consumedTiles.length) return true;
+          if (invalidInternal || gapFillCount !== 1) return true;
+
+          const edgeAppendCount = frontCount + backCount;
+          if (edgeAppendCount > 1) return true;
+          if (edgeAppendCount === 1 && !appendedOneSide) return true;
+
+          const extensionType = edgeAppendCount === 1 ? "gap-fill+append" : "gap-fill";
+          pushExtension(consumedTiles, resultGroup, resultAnalysis, extensionType, true);
           return true;
         });
         if (completed === false) break;
@@ -1346,6 +1422,13 @@ class AIBaseStrategy {
   }
 
   buildChainAppendCandidate(state, ctx, plan) {
+    if (
+      plan.budget.requireAllFreedTilesUsedOrRetained
+      && (plan.remainingFreeTiles?.length || 0) > 0
+    ) {
+      return null;
+    }
+
     const sourceGroupIndices = Array.from(new Set([
       ...plan.donorGroupIndices,
       ...plan.recipientGroupIndices
@@ -1467,6 +1550,7 @@ class AIBaseStrategy {
               recipientGroupIndices,
               retainedGroups,
               recipientExtensions,
+              remainingFreeTiles,
               tailPlan,
               budget
             });
@@ -1900,6 +1984,15 @@ class AIBaseStrategy {
     return candidates;
   }
 
+  isReserveWorthyChainCandidate(candidate) {
+    if (!candidate) return false;
+    const stats = candidate.stats || {};
+    return (stats.chainAppendMultiRecipient || 0) > 0
+      || (stats.chainAppendTailBuilt || 0) > 0
+      || (stats.chainAppendSameRecipientDouble || 0) > 0
+      || (candidate.rackReduction || 0) >= 2;
+  }
+
   generateRearrangementMoves(state, ctx) {
     const buckets = [];
     const reservedBuckets = [];
@@ -1924,7 +2017,11 @@ class AIBaseStrategy {
         this.config.chainAppendQuota ?? this.config.maxRearrangeBranches
       );
       const reserve = Math.max(0, this.config.chainAppendReserve || 0);
-      reservedBuckets.push(...chainCandidates.slice(0, reserve));
+      reservedBuckets.push(
+        ...chainCandidates
+          .filter(candidate => this.isReserveWorthyChainCandidate(candidate))
+          .slice(0, reserve)
+      );
       buckets.push(...chainCandidates);
     }
     if (this.modeEnabled("joker-gap")) {
