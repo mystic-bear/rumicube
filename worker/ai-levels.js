@@ -288,12 +288,12 @@ class AILevel5Strategy extends AIBaseStrategy {
       crowdedBudgets: {
         bridgeMaxTouchedGroups: 2,
         exactMaxTouchedGroups: 2,
-        exactMaxPartitionSolutions: 2,
+        exactMaxPartitionSolutions: 3,
         bridgeMaxPartitionSolutions: 2,
         chainAppendMaxTouchedGroups: 4,
         chainAppendMaxDonorGroups: 2,
         chainAppendMaxRecipientGroups: 2,
-        chainAppendMaxFreeTableTiles: 4,
+        chainAppendMaxFreeTableTiles: 5,
         chainAppendMaxRackSubsetSize: 2
       },
       protectedRackSubsets: true,
@@ -499,13 +499,13 @@ class AILevel6Strategy extends AIBaseStrategy {
       chainAppendRequireAllFreedTilesUsedOrRetained: true,
       crowdedBudgets: {
         bridgeMaxTouchedGroups: 2,
-        exactMaxTouchedGroups: 2,
-        exactMaxPartitionSolutions: 2,
+        exactMaxTouchedGroups: 3,
+        exactMaxPartitionSolutions: 4,
         bridgeMaxPartitionSolutions: 2,
         chainAppendMaxTouchedGroups: 4,
         chainAppendMaxDonorGroups: 2,
         chainAppendMaxRecipientGroups: 2,
-        chainAppendMaxFreeTableTiles: 5,
+        chainAppendMaxFreeTableTiles: 6,
         chainAppendMaxRackSubsetSize: 3
       },
       protectedRackSubsets: true,

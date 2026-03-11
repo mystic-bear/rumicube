@@ -345,7 +345,8 @@ class AIBaseStrategy {
       "chain-append": chainAppendDefaults
     };
 
-    if (state.table.length >= crowdedTableThreshold) {
+    const isCrowded = state.table.length >= crowdedTableThreshold;
+    if (isCrowded) {
       effective.maxTouchedGroups = Math.min(effective.maxTouchedGroups || 2, 2);
       effective.maxPartitionSolutions = Math.min(effective.maxPartitionSolutions || 4, 2);
       effective.maxPartitionSolutionsBridge = Math.min(
@@ -353,8 +354,12 @@ class AIBaseStrategy {
         2
       );
       const crowdedBudgets = baseConfig.crowdedBudgets || {};
-      const crowdedExactTouchedCap = isLevel6 && isHintMode ? 3 : 2;
-      const crowdedExactPartitionCap = isLevel6 ? 3 : 2;
+      const crowdedExactTouchedCap = isLevel6
+        ? (isHintMode ? 4 : 3)
+        : 2;
+      const crowdedExactPartitionCap = isLevel6
+        ? (isHintMode ? 4 : 3)
+        : 2;
       effective.generatorBudgets.bridge = {
         ...effective.generatorBudgets.bridge,
         maxTouchedGroups: crowdedBudgets.bridgeMaxTouchedGroups || 2,
@@ -378,6 +383,23 @@ class AIBaseStrategy {
         maxRackSubsetSize: crowdedBudgets.chainAppendMaxRackSubsetSize
           || effective.generatorBudgets["chain-append"].maxRackSubsetSize
       };
+      if (isLevel6 && isHintMode) {
+        effective.generatorBudgets["chain-append"] = {
+          ...effective.generatorBudgets["chain-append"],
+          maxTouchedGroups: Math.max(
+            effective.generatorBudgets["chain-append"].maxTouchedGroups || 0,
+            4
+          ),
+          maxFreeTableTiles: Math.max(
+            effective.generatorBudgets["chain-append"].maxFreeTableTiles || 0,
+            6
+          ),
+          maxRackSubsetSize: Math.max(
+            effective.generatorBudgets["chain-append"].maxRackSubsetSize || 0,
+            3
+          )
+        };
+      }
     }
     return effective;
   }
