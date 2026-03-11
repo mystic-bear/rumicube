@@ -5,7 +5,40 @@ class AIBaseStrategy {
   }
 
   chooseMove(gameState) {
-    const initialState = {
+    const initialState = this.createInitialState(gameState);
+    const ctx = this.createSearchContext(gameState, initialState);
+    const searchSchedule = this.buildSearchSchedule(gameState, ctx);
+    let best = null;
+    let emergencyBest = null;
+
+    for (const passConfig of searchSchedule) {
+      if (this.isTimedOut(ctx)) break;
+
+      const passResult = this.runBeamPass(initialState, ctx, passConfig);
+      if (!emergencyBest && passResult.best) {
+        emergencyBest = passResult.best;
+      }
+
+      if (passResult.completed) {
+        if (passResult.best && (!best || this.compareCandidateOrder(passResult.best, best, ctx, "finalScore") < 0)) {
+          best = passResult.best;
+        }
+        continue;
+      }
+
+      if (!best && passResult.best) {
+        emergencyBest = passResult.best;
+      }
+      break;
+    }
+
+    const finalBest = best || emergencyBest;
+    if (!finalBest) return null;
+    return this.buildMove(finalBest, ctx);
+  }
+
+  createInitialState(gameState) {
+    return {
       rack: deepCopy(gameState.currentPlayer.rack),
       table: normalizeTableGroups(deepCopy(gameState.table)),
       opened: gameState.currentPlayer.opened,
@@ -29,53 +62,157 @@ class AIBaseStrategy {
         jokerNotes: []
       }
     };
+  }
 
-    const ctx = {
+  createSearchContext(gameState, initialState) {
+    return {
       gameState,
       startedAt: Date.now(),
       rackGroupCache: new Map(),
       poolGroupCache: new Map(),
+      transpositionTable: new Map(),
+      finishableCache: new Map(),
+      evalCache: new Map(),
       initialRackSize: initialState.rack.length,
       initialTableSize: initialState.table.length,
       initialJokerCount: initialState.rack.filter(tile => tile.joker).length
     };
+  }
 
+  buildSearchSchedule(gameState, ctx) {
+    const fallback = [{ maxDepth: this.config.maxDepth, beamWidth: this.config.beamWidth }];
+    const rawSchedule = this.level >= 3
+      && Array.isArray(this.config.searchSchedule)
+      && this.config.searchSchedule.length > 0
+      ? this.config.searchSchedule
+      : fallback;
+
+    const normalized = rawSchedule
+      .map(pass => ({
+        maxDepth: Math.max(1, Math.min(this.config.maxDepth, Number(pass?.maxDepth) || this.config.maxDepth)),
+        beamWidth: Math.max(1, Math.min(this.config.beamWidth, Number(pass?.beamWidth) || this.config.beamWidth))
+      }))
+      .filter(pass => pass.maxDepth > 0 && pass.beamWidth > 0);
+
+    const finalPass = {
+      maxDepth: Math.max(1, this.config.maxDepth),
+      beamWidth: Math.max(1, this.config.beamWidth)
+    };
+    const lastPass = normalized[normalized.length - 1];
+    if (!lastPass || lastPass.maxDepth !== finalPass.maxDepth || lastPass.beamWidth !== finalPass.beamWidth) {
+      normalized.push(finalPass);
+    }
+
+    return normalized;
+  }
+
+  runBeamPass(initialState, ctx, passConfig) {
+    const seen = ctx.transpositionTable;
     let best = null;
-    let frontier = [initialState];
-    const seen = new Map();
+    let frontier = [RummyAIUtils.cloneState(initialState)];
+    let completed = true;
 
-    for (let depth = 1; depth <= this.config.maxDepth; depth += 1) {
-      if (this.isTimedOut(ctx)) break;
+    for (let depth = 1; depth <= passConfig.maxDepth; depth += 1) {
+      if (this.isTimedOut(ctx)) {
+        completed = false;
+        break;
+      }
+
       const nextFrontier = [];
-
       for (const state of frontier) {
         const candidates = this.generateCandidates(state, ctx);
         for (const candidate of candidates) {
-          if (this.isTimedOut(ctx)) break;
-          const key = RummyAIUtils.serializeState(candidate);
-          const value = this.scoreCandidate(candidate, ctx);
-          if (seen.has(key) && seen.get(key) >= value) continue;
-          seen.set(key, value);
-          candidate.evalScore = value;
+          if (this.isTimedOut(ctx)) {
+            completed = false;
+            break;
+          }
 
+          const remainingDepth = passConfig.maxDepth - depth;
+          const key = `${this.getSearchStateKey(candidate)}|d=${remainingDepth}`;
+          const value = this.scoreCandidate(candidate, ctx);
+          const currentBest = seen.get(key);
+          if (typeof currentBest === "number" && currentBest > value) continue;
+          if (typeof currentBest !== "number" || value > currentBest) {
+            seen.set(key, value);
+          }
+
+          candidate.evalScore = value;
           if (this.canFinishTurn(candidate, ctx)) {
             candidate.finalScore = this.evaluateState(candidate, ctx, true);
-            if (!best || candidate.finalScore > best.finalScore) {
+            if (!best || this.compareCandidateOrder(candidate, best, ctx, "finalScore") < 0) {
               best = candidate;
             }
           }
           nextFrontier.push(candidate);
         }
-        if (this.isTimedOut(ctx)) break;
+        if (!completed) break;
       }
 
+      if (!completed) break;
       if (nextFrontier.length === 0) break;
-      nextFrontier.sort((a, b) => b.evalScore - a.evalScore);
-      frontier = nextFrontier.slice(0, this.config.beamWidth);
+
+      nextFrontier.sort((a, b) => this.compareCandidateOrder(a, b, ctx, "evalScore"));
+      frontier = nextFrontier.slice(0, passConfig.beamWidth);
     }
 
-    if (!best) return null;
-    return this.buildMove(best, ctx);
+    return { best, completed };
+  }
+
+  getPrimaryScore(candidate, ctx, scoreSource = "evalScore") {
+    if (!candidate) return -Infinity;
+    if (typeof scoreSource === "function") return scoreSource(candidate, ctx);
+    return candidate[scoreSource] ?? -Infinity;
+  }
+
+  getSearchStateKey(state) {
+    if (!state.searchStateKey) {
+      state.searchStateKey = RummyAIUtils.serializeSearchState(state);
+    }
+    return state.searchStateKey;
+  }
+
+  getEvalCacheKey(state, terminal, namespace = "base") {
+    return `${namespace}|${this.getSearchStateKey(state)}|terminal=${terminal ? 1 : 0}`;
+  }
+
+  getCandidateTieBreakData(state, ctx) {
+    if (state.tieBreakData) return state.tieBreakData;
+
+    const openingGroups = state.table.slice(state.baseTableCount);
+    state.tieBreakData = {
+      rackReduction: ctx.initialRackSize - state.rack.length,
+      openingScore: calculateInitialOpenScore(openingGroups),
+      actionScore: state.stats?.actionScore || 0,
+      futureMobility: this.countAppendableRackTiles(state),
+      touchedGroups: state.stats?.touchedGroups || 0
+    };
+    return state.tieBreakData;
+  }
+
+  compareCandidateOrder(a, b, ctx, scoreSource = "evalScore") {
+    const primaryGap = this.getPrimaryScore(b, ctx, scoreSource) - this.getPrimaryScore(a, ctx, scoreSource);
+    if (primaryGap !== 0) return primaryGap;
+
+    const left = this.getCandidateTieBreakData(a, ctx);
+    const right = this.getCandidateTieBreakData(b, ctx);
+    const comparisons = [
+      right.rackReduction - left.rackReduction,
+      right.openingScore - left.openingScore,
+      right.actionScore - left.actionScore,
+      right.futureMobility - left.futureMobility,
+      left.touchedGroups - right.touchedGroups
+    ];
+
+    for (const comparison of comparisons) {
+      if (comparison !== 0) return comparison;
+    }
+
+    return this.getSearchStateKey(a).localeCompare(this.getSearchStateKey(b));
+  }
+
+  getRemainingTimeMs(ctx) {
+    if (!this.config.timeLimitMs) return Infinity;
+    return Math.max(0, this.config.timeLimitMs - (Date.now() - ctx.startedAt));
   }
 
   isTimedOut(ctx) {
@@ -180,7 +317,7 @@ class AIBaseStrategy {
   dedupeAndSortCandidates(candidates, ctx, limit) {
     const deduped = new Map();
     candidates.forEach(candidate => {
-      const key = RummyAIUtils.serializeState(candidate);
+      const key = this.getSearchStateKey(candidate);
       const current = deduped.get(key);
       const value = this.getCandidateSortValue(candidate, ctx);
       if (!current || value > this.getCandidateSortValue(current, ctx)) {
@@ -188,8 +325,7 @@ class AIBaseStrategy {
       }
     });
     const ordered = [...deduped.values()].sort((a, b) =>
-      this.getCandidateSortValue(b, ctx) - this.getCandidateSortValue(a, ctx) ||
-      (b.stats.actionScore || 0) - (a.stats.actionScore || 0)
+      this.compareCandidateOrder(a, b, ctx, candidate => this.getCandidateSortValue(candidate, ctx))
     );
     return typeof limit === "number" ? ordered.slice(0, limit) : ordered;
   }
@@ -226,10 +362,7 @@ class AIBaseStrategy {
     moves.forEach(move => {
       move.previewScore = this.scoreCandidate(move, ctx);
     });
-    moves.sort((a, b) =>
-      (b.previewScore || 0) - (a.previewScore || 0) ||
-      (b.stats.actionScore || 0) - (a.stats.actionScore || 0)
-    );
+    moves.sort((a, b) => this.compareCandidateOrder(a, b, ctx, "previewScore"));
     return moves.slice(0, quota);
   }
 
@@ -426,6 +559,11 @@ class AIBaseStrategy {
   }
 
   canFinishTurn(state, ctx) {
+    const cacheKey = this.getSearchStateKey(state);
+    if (ctx.finishableCache.has(cacheKey)) {
+      return ctx.finishableCache.get(cacheKey);
+    }
+
     const reducedDuringSearch = state.rack.length < ctx.initialRackSize;
     const reducedEarlierThisTurn = !!(
       ctx.gameState.hintMode
@@ -437,17 +575,33 @@ class AIBaseStrategy {
         )
       )
     );
-    if (!reducedDuringSearch && !reducedEarlierThisTurn) return false;
-    if (state.table.some(group => !RummyRules.analyzeGroup(group).valid)) return false;
+    if (!reducedDuringSearch && !reducedEarlierThisTurn) {
+      ctx.finishableCache.set(cacheKey, false);
+      return false;
+    }
+    if (state.table.some(group => !RummyRules.analyzeGroup(group).valid)) {
+      ctx.finishableCache.set(cacheKey, false);
+      return false;
+    }
 
     const { ruleOptions, currentPlayer } = ctx.gameState;
-    if (!ruleOptions.initial30 || currentPlayer.opened) return true;
+    if (!ruleOptions.initial30 || currentPlayer.opened) {
+      ctx.finishableCache.set(cacheKey, true);
+      return true;
+    }
 
     const openingGroups = state.table.slice(state.baseTableCount);
-    return isInitialOpenSatisfied(openingGroups);
+    const finishable = isInitialOpenSatisfied(openingGroups);
+    ctx.finishableCache.set(cacheKey, finishable);
+    return finishable;
   }
 
   evaluateState(state, ctx, terminal) {
+    const cacheKey = this.getEvalCacheKey(state, terminal, "base");
+    if (ctx.evalCache.has(cacheKey)) {
+      return ctx.evalCache.get(cacheKey);
+    }
+
     const rackReduction = ctx.initialRackSize - state.rack.length;
     const rackGroups = RummyAIUtils.getValidGroupsFromTiles(state.rack, ctx.rackGroupCache, state.rack.length);
     const coverableIds = new Set();
@@ -502,6 +656,7 @@ class AIBaseStrategy {
       }
     }
 
+    ctx.evalCache.set(cacheKey, score);
     return score;
   }
 
@@ -558,8 +713,8 @@ class AIBaseStrategy {
     const rackMoves = this.generateRackGroupMoves(state, ctx);
     const appendMoves = this.generateAppendMoves(state, ctx);
     const safeAppendMoves = appendMoves.filter(candidate => this.isSafeAppendCandidate(candidate));
-    const safeKeys = new Set(safeAppendMoves.map(candidate => RummyAIUtils.serializeState(candidate)));
-    const regularAppendMoves = appendMoves.filter(candidate => !safeKeys.has(RummyAIUtils.serializeState(candidate)));
+    const safeKeys = new Set(safeAppendMoves.map(candidate => this.getSearchStateKey(candidate)));
+    const regularAppendMoves = appendMoves.filter(candidate => !safeKeys.has(this.getSearchStateKey(candidate)));
 
     const baselineMoves = this.dedupeAndSortCandidates([
       ...this.pickQuota(rackMoves, ctx, this.config.newGroupQuota ?? this.config.maxBranchesPerState),
@@ -1175,6 +1330,11 @@ class AIBaseStrategy {
 }
 
 AIBaseStrategy.prototype.canFinishTurn = function(state, ctx) {
+  const cacheKey = this.getSearchStateKey(state);
+  if (ctx.finishableCache.has(cacheKey)) {
+    return ctx.finishableCache.get(cacheKey);
+  }
+
   const reducedDuringSearch = state.rack.length < ctx.initialRackSize;
   const reducedEarlierThisTurn = !!(
     ctx.gameState.hintMode
@@ -1186,14 +1346,25 @@ AIBaseStrategy.prototype.canFinishTurn = function(state, ctx) {
       )
     )
   );
-  if (!reducedDuringSearch && !reducedEarlierThisTurn) return false;
-  if (state.table.some(group => !RummyRules.analyzeGroup(group).valid)) return false;
+  if (!reducedDuringSearch && !reducedEarlierThisTurn) {
+    ctx.finishableCache.set(cacheKey, false);
+    return false;
+  }
+  if (state.table.some(group => !RummyRules.analyzeGroup(group).valid)) {
+    ctx.finishableCache.set(cacheKey, false);
+    return false;
+  }
 
   const { ruleOptions, currentPlayer } = ctx.gameState;
-  if (!ruleOptions.initial30 || currentPlayer.opened) return true;
+  if (!ruleOptions.initial30 || currentPlayer.opened) {
+    ctx.finishableCache.set(cacheKey, true);
+    return true;
+  }
 
   const openingGroups = state.table.slice(state.baseTableCount);
-  return isInitialOpenSatisfied(openingGroups);
+  const finishable = isInitialOpenSatisfied(openingGroups);
+  ctx.finishableCache.set(cacheKey, finishable);
+  return finishable;
 };
 
 AIBaseStrategy.prototype.generateJokerSubstitutionMoves = function(state, ctx) {

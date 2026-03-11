@@ -17,6 +17,7 @@ class Game {
   }
 
   resetRound() {
+    this.clearScheduledTurnTimers();
     this.players = [];
     this.turn = 0;
     this.bag = [];
@@ -32,6 +33,7 @@ class Game {
     this.drawnTileId = null;
     this.gameOver = false;
     this.aiTimer = null;
+    this.turnAdvanceTimer = null;
     this.lastHint = null;
     this.consecutiveStrategicDrawsByPlayer = [];
     this.openingHoldDrawUsed = [];
@@ -282,7 +284,7 @@ class Game {
   }
 
   beginTurn() {
-    clearTimeout(this.aiTimer);
+    this.clearScheduledTurnTimers();
     this.workingTable = deepCopy(this.table);
     this.baseTableCount = this.table.length;
     this.selectedRackIds = new Set();
@@ -621,6 +623,7 @@ class Game {
   }
   passTurn() {
     if (this.gameOver) return;
+    this.clearScheduledTurnTimers();
     this.turn = (this.turn + 1) % this.players.length;
     this.beginTurn();
     ui.updateAll();
@@ -635,7 +638,7 @@ class Game {
   }
   win(player) {
     this.gameOver = true;
-    clearTimeout(this.aiTimer);
+    this.clearScheduledTurnTimers();
     document.getElementById("win-emoji").innerText = player.icon;
     document.getElementById("win-title").innerText = `${player.name} 승리!`;
     document.getElementById("win-text").innerText = `${player.icon} ${player.name}가 손패를 모두 비웠습니다.`;
@@ -648,7 +651,7 @@ class Game {
   }
 
   toMenu() {
-    clearTimeout(this.aiTimer);
+    this.clearScheduledTurnTimers();
     document.getElementById("modal").classList.remove("show");
     document.body.classList.remove("night-mode");
     ui.showScreen("start-screen");
@@ -680,9 +683,17 @@ Game.prototype.setInputLock = function(locked, token = null) {
 };
 
 Game.prototype.invalidateAsyncState = function() {
+  this.clearScheduledTurnTimers();
   this.asyncEpoch = (this.asyncEpoch || 0) + 1;
   this.inputLockToken = (this.inputLockToken || 0) + 1;
   this.setInputLock(false);
+};
+
+Game.prototype.clearScheduledTurnTimers = function() {
+  clearTimeout(this.aiTimer);
+  clearTimeout(this.turnAdvanceTimer);
+  this.aiTimer = null;
+  this.turnAdvanceTimer = null;
 };
 
 Game.prototype.startInputLockSession = function() {
@@ -700,6 +711,23 @@ Game.prototype.finishInputLockSession = function(session) {
   return this.setInputLock(false, session.lockToken);
 };
 
+Game.prototype.scheduleTurnAdvance = function(delayMs) {
+  clearTimeout(this.turnAdvanceTimer);
+
+  const scheduledEpoch = this.asyncEpoch || 0;
+  const scheduledVersion = this.stateVersion;
+
+  this.turnAdvanceTimer = setTimeout(() => {
+    this.turnAdvanceTimer = null;
+
+    if (this.gameOver) return;
+    if ((this.asyncEpoch || 0) !== scheduledEpoch) return;
+    if (this.stateVersion !== scheduledVersion) return;
+
+    this.passTurn();
+  }, delayMs);
+};
+
 Game.prototype.fallbackAiDraw = function(playerIndex) {
   this.consecutiveStrategicDrawsByPlayer[playerIndex] = 0;
   if (this.bag.length > 0) {
@@ -711,7 +739,7 @@ Game.prototype.fallbackAiDraw = function(playerIndex) {
     ui.toast(`${this.currentPlayer.icon} ${this.currentPlayer.name}님이 둘 수를 찾지 못했습니다.`);
   }
   ui.updateAll();
-  setTimeout(() => this.passTurn(), 650);
+  this.scheduleTurnAdvance(650);
 };
 
 Game.prototype.applyAiMove = function(move, playerIndex) {
@@ -742,7 +770,7 @@ Game.prototype.applyAiMove = function(move, playerIndex) {
       ui.toast(`${this.currentPlayer.icon} ${this.currentPlayer.name}님이 더 이상 뽑을 수 없습니다.`);
     }
     ui.updateAll();
-    setTimeout(() => this.passTurn(), 650);
+    this.scheduleTurnAdvance(650);
     return;
   }
 
@@ -768,7 +796,7 @@ Game.prototype.applyAiMove = function(move, playerIndex) {
     return;
   }
 
-  setTimeout(() => this.passTurn(), 700);
+  this.scheduleTurnAdvance(700);
 };
 
 Game.prototype.applyHint = function(hint) {

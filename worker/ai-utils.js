@@ -26,6 +26,12 @@ class RummyAIUtils {
     return `${rackKey}::${serializeTableState(state.table)}`;
   }
 
+  static serializeSearchState(state) {
+    const rackKey = state.rack.map(tile => tile.id).sort((a, b) => a - b).join(",");
+    const tableKey = serializeTableState(state.table);
+    return `${rackKey}::${tableKey}::opened=${state.opened ? 1 : 0}::base=${state.baseTableCount || 0}`;
+  }
+
   static getValidGroupsFromTiles(tiles, cache, maxSize = tiles.length) {
     const ids = tiles.map(tile => tile.id).sort((a, b) => a - b).join(",");
     const key = `${ids}|${maxSize}`;

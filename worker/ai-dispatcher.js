@@ -44,6 +44,15 @@ class RummyAI {
         : undefined;
       const move = strategy.chooseMove(gameState, moveOptions);
       if (move) move.engineLevel = currentLevel;
+      if (
+        move
+        && currentLevel >= 3
+        && currentLevel <= 5
+        && bestMove
+        && !this.passesLegacyFloor(move, bestMove, gameState, currentLevel)
+      ) {
+        continue;
+      }
       const comparison = this.compareMovePriority(move, bestMove, gameState);
       if (comparison > 0 || (comparison === 0 && move && currentLevel > bestLevel)) {
         bestMove = move;
@@ -78,24 +87,42 @@ class RummyAI {
           valid: 0,
           openingReady: 0,
           rackReduction: -1,
+          safeAppendLike: 0,
+          jokerPreserve: 0,
           stability: -999,
-          safeAppend: 0,
-          score: -Infinity
+          actionValue: -Infinity,
+          futureMobility: -Infinity,
+          openingScore: -Infinity
         };
       }
+
+      const profile = this.getMoveProfile(move, gameState);
       return {
         valid: 1,
-        openingReady: openingRequired ? Number((move.openingScore || 0) >= 30) : 1,
-        rackReduction: move.rackReduction || 0,
-        stability: (move.stableGroups || 0) - (move.fragileGroups || 0) - ((move.stats?.touchedGroups || 0) * 0.25),
-        safeAppend: Number(move.type === "append" && (move.stats?.rearrangeCount || 0) === 0),
-        actionValue: move.stats?.actionScore || 0
+        openingReady: openingRequired ? Number(profile.openingReady) : 1,
+        rackReduction: profile.rackReduction,
+        safeAppendLike: profile.safeAppendLike,
+        jokerPreserve: Number(!profile.usesRackJoker),
+        stability: profile.stability,
+        actionValue: profile.actionValue,
+        futureMobility: profile.futureMobility,
+        openingScore: profile.openingScore
       };
     };
 
     const a = normalize(candidate);
     const b = normalize(current);
-    const keys = ["valid", "openingReady", "rackReduction", "safeAppend", "stability", "actionValue"];
+    const keys = [
+      "valid",
+      "openingReady",
+      "rackReduction",
+      "safeAppendLike",
+      "jokerPreserve",
+      "stability",
+      "actionValue",
+      "futureMobility",
+      "openingScore"
+    ];
     for (const key of keys) {
       if (a[key] !== b[key]) return a[key] > b[key] ? 1 : -1;
     }
@@ -104,6 +131,106 @@ class RummyAI {
 
   static isBetterMove(candidate, current, gameState) {
     return this.compareMovePriority(candidate, current, gameState) > 0;
+  }
+
+  static getMoveProfile(move, gameState) {
+    if (!move) {
+      return {
+        openingReady: false,
+        rackReduction: -1,
+        openingScore: 0,
+        futureMobility: 0,
+        actionValue: 0,
+        touchedGroups: Infinity,
+        rearrangeCount: Infinity,
+        stableGroups: 0,
+        fragileGroups: Infinity,
+        stability: -999,
+        usesRackJoker: true,
+        safeAppendLike: 0
+      };
+    }
+
+    const currentRackJokers = gameState.currentPlayer.rack.filter(tile => tile.joker).length;
+    const nextRackJokers = (move.rack || []).filter(tile => tile.joker).length;
+    const touchedGroups = move.stats?.touchedGroups || 0;
+    const rearrangeCount = move.stats?.rearrangeCount || 0;
+    const stableGroups = move.stableGroups || 0;
+    const fragileGroups = move.fragileGroups || 0;
+    const usesRackJoker = nextRackJokers < currentRackJokers;
+    const safeAppendLike = Number(
+      rearrangeCount === 0
+      && touchedGroups <= 1
+      && !usesRackJoker
+      && (move.type === "append" || move.type === "new-group")
+    );
+
+    return {
+      openingReady: (move.openingScore || 0) >= 30,
+      rackReduction: move.rackReduction || 0,
+      openingScore: move.openingScore || 0,
+      futureMobility: move.futureMobility || 0,
+      actionValue: move.stats?.actionScore || 0,
+      touchedGroups,
+      rearrangeCount,
+      stableGroups,
+      fragileGroups,
+      stability: stableGroups - fragileGroups - (touchedGroups * 0.25),
+      usesRackJoker,
+      safeAppendLike
+    };
+  }
+
+  static passesLegacyFloor(candidate, floor, gameState, level) {
+    if (!candidate) return false;
+    if (!floor) return true;
+
+    const openingRequired = gameState.ruleOptions.initial30 && !gameState.currentPlayer.opened;
+    const candidateProfile = this.getMoveProfile(candidate, gameState);
+    const floorProfile = this.getMoveProfile(floor, gameState);
+    const rackGain = candidateProfile.rackReduction - floorProfile.rackReduction;
+    const openingGain = candidateProfile.openingScore - floorProfile.openingScore;
+    const mobilityGain = candidateProfile.futureMobility - floorProfile.futureMobility;
+    const stabilityGain = candidateProfile.stability - floorProfile.stability;
+    const overrideAllowed = (
+      rackGain >= 1
+      || openingGain >= 4
+      || mobilityGain >= 3
+      || stabilityGain >= 2
+    );
+
+    if (openingRequired && floorProfile.openingReady && !candidateProfile.openingReady) {
+      return false;
+    }
+    if (candidateProfile.rackReduction < floorProfile.rackReduction) {
+      return false;
+    }
+    if (
+      floorProfile.safeAppendLike
+      && (candidateProfile.rearrangeCount > 0 || candidateProfile.usesRackJoker)
+      && rackGain <= 0
+      && openingGain <= 0
+    ) {
+      return false;
+    }
+    if (
+      candidateProfile.fragileGroups > floorProfile.fragileGroups
+      && rackGain <= 0
+      && !overrideAllowed
+    ) {
+      return false;
+    }
+    if (
+      !floorProfile.usesRackJoker
+      && candidateProfile.usesRackJoker
+      && openingGain <= 0
+      && rackGain <= 0
+      && !overrideAllowed
+    ) {
+      return false;
+    }
+
+    return true;
   }
 
   static passesLevel6Floor(expert, floor, gameState) {
@@ -177,10 +304,26 @@ class RummyAI {
     };
   }
 
-  static collectUsefulDrawKeys(state) {
+  static classifyUsefulDrawKeys(state) {
     const nonJokers = state.rack.filter(tile => !tile.joker);
-    const usefulKeys = new Set();
+    const exactCompletionKeys = new Set();
+    const extensionKeys = new Set();
+    const setCompletionKeys = new Set();
+    const runCompletionKeys = new Set();
+    const duplicateOnlyKeys = new Set();
+    const rackKeyCounts = new Map();
     let nearCompleteCount = 0;
+
+    const addExtensionKey = (key) => {
+      if (!exactCompletionKeys.has(key)) {
+        extensionKeys.add(key);
+      }
+    };
+
+    nonJokers.forEach(tile => {
+      const tileKey = `${tile.color}-${tile.number}`;
+      rackKeyCounts.set(tileKey, (rackKeyCounts.get(tileKey) || 0) + 1);
+    });
 
     for (let i = 0; i < nonJokers.length; i += 1) {
       for (let j = i + 1; j < nonJokers.length; j += 1) {
@@ -193,6 +336,10 @@ class RummyAI {
           COLORS.forEach(color => {
             if (!usedColors.has(color.key)) neededKeys.push(`${color.key}-${a.number}`);
           });
+          neededKeys.forEach(key => {
+            exactCompletionKeys.add(key);
+            setCompletionKeys.add(key);
+          });
         }
 
         if (a.color === b.color) {
@@ -203,43 +350,106 @@ class RummyAI {
             if (hi < 13) neededKeys.push(`${a.color}-${hi + 1}`);
           } else if (hi - lo === 2) {
             neededKeys.push(`${a.color}-${lo + 1}`);
+          } else if (hi - lo === 3) {
+            neededKeys.push(`${a.color}-${lo + 1}`);
+            neededKeys.push(`${a.color}-${hi - 1}`);
           }
+          neededKeys.forEach(key => {
+            if (hi - lo <= 2) {
+              exactCompletionKeys.add(key);
+              runCompletionKeys.add(key);
+            } else {
+              addExtensionKey(key);
+            }
+          });
         }
 
-        if (neededKeys.length === 0) continue;
-        nearCompleteCount += 1;
-        neededKeys.forEach(key => usefulKeys.add(key));
+        if (neededKeys.length > 0) {
+          nearCompleteCount += 1;
+        }
       }
     }
 
+    nonJokers.forEach(tile => {
+      COLORS.forEach(color => {
+        if (color.key !== tile.color) addExtensionKey(`${color.key}-${tile.number}`);
+      });
+      if (tile.number > 1) addExtensionKey(`${tile.color}-${tile.number - 1}`);
+      if (tile.number < 13) addExtensionKey(`${tile.color}-${tile.number + 1}`);
+    });
+
+    extensionKeys.forEach(key => {
+      if (exactCompletionKeys.has(key)) return;
+      if (rackKeyCounts.has(key)) {
+        duplicateOnlyKeys.add(key);
+      }
+    });
+
     return {
       nearCompleteCount,
-      usefulKeys: [...usefulKeys]
+      exactCompletionKeys: [...exactCompletionKeys],
+      extensionKeys: [...extensionKeys],
+      setCompletionKeys: [...setCompletionKeys],
+      runCompletionKeys: [...runCompletionKeys],
+      duplicateOnlyKeys: [...duplicateOnlyKeys]
     };
   }
 
   static computeDrawAwarenessForDecision(state, gameState) {
     const tracker = gameState.tileTracker;
-    const pairInfo = this.collectUsefulDrawKeys(state);
+    const classification = this.classifyUsefulDrawKeys(state);
+    const exactKeySet = new Set(classification.exactCompletionKeys);
+    const extensionKeySet = new Set(classification.extensionKeys);
+    const setKeySet = new Set(classification.setCompletionKeys);
+    const runKeySet = new Set(classification.runCompletionKeys);
+    const duplicateKeySet = new Set(classification.duplicateOnlyKeys);
+    const usefulKeySet = new Set([...exactKeySet, ...extensionKeySet]);
+    const keyMetrics = [];
     let usefulRemaining = 0;
     let deadKeys = 0;
+    let weightedHitMass = 0;
 
-    if (tracker && tracker.uncertainTotal > 0) {
-      pairInfo.usefulKeys.forEach(key => {
-        const remaining = tracker.uncertain[key] || 0;
-        usefulRemaining += remaining;
-        if (remaining === 0) deadKeys += 1;
+    usefulKeySet.forEach(key => {
+      const remaining = tracker?.uncertain?.[key] || 0;
+      const weight = (
+        (exactKeySet.has(key) ? 3.8 : 0)
+        + (setKeySet.has(key) ? 0.8 : 0)
+        + (runKeySet.has(key) ? 0.9 : 0)
+        + (extensionKeySet.has(key) ? 1.4 : 0)
+        - (duplicateKeySet.has(key) ? 0.35 : 0)
+      );
+      usefulRemaining += remaining;
+      if (remaining === 0) deadKeys += 1;
+      weightedHitMass += remaining * Math.max(0.5, weight);
+      keyMetrics.push({
+        key,
+        remaining,
+        weight: Math.max(0.5, weight),
+        isExact: exactKeySet.has(key),
+        isExtension: extensionKeySet.has(key),
+        isSetCompletion: setKeySet.has(key),
+        isRunCompletion: runKeySet.has(key),
+        isDuplicateOnly: duplicateKeySet.has(key)
       });
-    }
+    });
 
     return {
-      nearCompleteCount: pairInfo.nearCompleteCount,
-      usefulKeysCount: pairInfo.usefulKeys.length,
+      nearCompleteCount: classification.nearCompleteCount,
+      usefulKeysCount: usefulKeySet.size,
       usefulRemaining,
       deadKeys,
       hitRate: tracker && tracker.uncertainTotal > 0
         ? usefulRemaining / tracker.uncertainTotal
-        : 0
+        : 0,
+      weightedHitMass: tracker && tracker.uncertainTotal > 0
+        ? weightedHitMass / tracker.uncertainTotal
+        : weightedHitMass,
+      exactCompletionKeys: classification.exactCompletionKeys,
+      extensionKeys: classification.extensionKeys,
+      setCompletionKeys: classification.setCompletionKeys,
+      runCompletionKeys: classification.runCompletionKeys,
+      duplicateOnlyKeys: classification.duplicateOnlyKeys,
+      keyMetrics
     };
   }
 
@@ -424,6 +634,106 @@ RummyAI.isCleanStrategicDrawBan = function(move, metrics) {
     && metrics.fragileIncrease <= 0;
 };
 
+RummyAI.getStrategicDrawThreshold = function(reasonCode, level) {
+  if (reasonCode === "hold-opening") return 112;
+  if (reasonCode === "preserve-shape") return 88;
+  if (reasonCode === "fish-completion") return level >= 6 ? 78 : Number.POSITIVE_INFINITY;
+  return 90;
+};
+
+RummyAI.estimateDrawEV = function(beforeDraw, gameState, bestMove, metrics, reasonCode, level) {
+  const keyMetrics = beforeDraw.keyMetrics || [];
+  const weightedMassValues = [];
+  let completionEV = 0;
+  let extensionEV = 0;
+
+  keyMetrics.forEach(entry => {
+    const mass = entry.remaining * entry.weight;
+    if (mass <= 0) return;
+    weightedMassValues.push(mass);
+
+    if (entry.isExact) {
+      completionEV += mass * (entry.isSetCompletion ? 11 : 12);
+    } else if (entry.isSetCompletion || entry.isRunCompletion) {
+      completionEV += mass * 8;
+    }
+
+    if (entry.isExtension) {
+      extensionEV += mass * (entry.isDuplicateOnly ? 2.5 : 5.5);
+    }
+  });
+
+  const weightedHitMass = Number((beforeDraw.weightedHitMass || 0).toFixed(4));
+  const totalMass = weightedMassValues.reduce((sum, value) => sum + value, 0);
+  const sortedMass = weightedMassValues.sort((a, b) => b - a);
+  const topOneShare = totalMass > 0 ? (sortedMass[0] || 0) / totalMass : 0;
+  const topTwoShare = totalMass > 0 ? ((sortedMass[0] || 0) + (sortedMass[1] || 0)) / totalMass : 0;
+  const concentrationRisk = Math.round(topOneShare * 24 + topTwoShare * 12);
+  const deadKeyPenalty = beforeDraw.usefulKeysCount > 0
+    ? Math.round((beforeDraw.deadKeys / beforeDraw.usefulKeysCount) * 28)
+    : 0;
+  const strategicDrawCountBefore = gameState.consecutiveStrategicDrawsByPlayer?.[gameState.turnIndex] || 0;
+  const openingHoldUsedBefore = gameState.openingHoldDrawUsed?.[gameState.turnIndex] || 0;
+
+  let tempoPenalty = Math.max(0, 12 - gameState.bagCount) * 5
+    + Math.max(0, 8 - metrics.opponentMinRack) * 14
+    + strategicDrawCountBefore * 18
+    + openingHoldUsedBefore * 10;
+  if (reasonCode === "hold-opening") {
+    tempoPenalty += 18;
+  } else if (reasonCode === "fish-completion" && level >= 6) {
+    tempoPenalty = Math.max(0, tempoPenalty - 8);
+  }
+
+  let abandonCost = (bestMove.rackReduction || 0) * 22
+    + metrics.futureLoss * 16
+    + metrics.appendLoss * 10
+    + metrics.nearLoss * 14
+    + (metrics.usesRackJoker ? 22 : 0)
+    + Math.max(0, metrics.touchedGroups - 1) * 8
+    + metrics.fragileIncrease * 20
+    + metrics.futureMobilityLoss * 12;
+
+  if (reasonCode === "hold-opening") {
+    abandonCost += Math.max(0, (bestMove.openingScore || 0) - 30) * 10;
+  } else if (reasonCode === "preserve-shape") {
+    abandonCost += Math.max(0, bestMove.futureMobility || 0) * 3;
+  } else if (reasonCode === "fish-completion") {
+    abandonCost += Math.max(0, bestMove.futureMobility || 0) * 2;
+  }
+
+  const reasonBonus = reasonCode === "hold-opening"
+    ? 10
+    : reasonCode === "fish-completion" && level >= 6
+      ? 6
+      : 0;
+  const thresholdUsed = this.getStrategicDrawThreshold(reasonCode, level);
+  const totalEV = Math.round(
+    completionEV
+      + extensionEV
+      + (weightedHitMass * 42)
+      + reasonBonus
+      - tempoPenalty
+      - abandonCost
+      - concentrationRisk
+      - deadKeyPenalty
+  );
+
+  return {
+    completionEV: Math.round(completionEV),
+    extensionEV: Math.round(extensionEV),
+    weightedHitMass,
+    tempoPenalty,
+    abandonCost,
+    concentrationRisk,
+    deadKeyPenalty,
+    thresholdUsed,
+    strategicDrawCountBefore,
+    openingHoldUsedBefore,
+    totalEV
+  };
+};
+
 RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
   if (level < 5) return null;
   if (!bestMove || bestMove.type === "draw") return null;
@@ -470,7 +780,8 @@ RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
     usesRackJoker,
     touchedGroups,
     fragileIncrease,
-    futureMobilityLoss
+    futureMobilityLoss,
+    opponentMinRack: smallestOpponentRack
   };
   if (this.isCleanStrategicDrawBan(bestMove, metrics)) return null;
 
@@ -479,13 +790,6 @@ RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
   if (smallestOpponentRack < 6) return null;
   if (currentRackCount < 6) return null;
 
-  const drawOpportunityBonus = level >= 6
-    ? Math.round((beforeDraw.hitRate || 0) * 20)
-    : Math.min(12, (beforeDraw.usefulKeysCount || 0) * 2);
-  const urgencyPenalty = Math.max(0, 8 - smallestOpponentRack) * 12
-    + Math.max(0, 12 - gameState.bagCount) * 6
-    + Math.max(0, 7 - currentRackCount) * 4;
-  const threshold = 80;
   const baseMeta = {
     openingScore: bestMove.openingScore || 0,
     usesRackJoker,
@@ -496,13 +800,22 @@ RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
     opponentMinRack: smallestOpponentRack,
     bagCount: gameState.bagCount,
     fragileIncrease,
-    futureMobilityLoss
+    futureMobilityLoss,
+    hitRate: beforeDraw.hitRate,
+    usefulKeysCount: beforeDraw.usefulKeysCount,
+    usefulRemaining: beforeDraw.usefulRemaining,
+    exactCompletionKeys: beforeDraw.exactCompletionKeys,
+    extensionKeys: beforeDraw.extensionKeys,
+    setCompletionKeys: beforeDraw.setCompletionKeys,
+    runCompletionKeys: beforeDraw.runCompletionKeys,
+    duplicateOnlyKeys: beforeDraw.duplicateOnlyKeys
   };
-  const chooseIfStrongEnough = (reasonCode, structuralCost, playAbandonPenalty, meta = {}) => {
-    const drawScore = Math.round(structuralCost + drawOpportunityBonus - playAbandonPenalty - urgencyPenalty);
-    if (drawScore < threshold) return null;
-    return this.makeStrategicDrawMove(reasonCode, drawScore, level, {
+  const chooseIfStrongEnough = (reasonCode, meta = {}) => {
+    const estimate = this.estimateDrawEV(beforeDraw, gameState, bestMove, metrics, reasonCode, level);
+    if (estimate.totalEV < estimate.thresholdUsed) return null;
+    return this.makeStrategicDrawMove(reasonCode, estimate.totalEV, level, {
       ...baseMeta,
+      ...estimate,
       ...meta
     });
   };
@@ -526,20 +839,9 @@ RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
       && smallestOpponentRack >= 7
       && holdSignals >= 1
     ) {
-      const structuralCost = (34 - openingScore) * 12
-        + (usesRackJoker ? 28 : 0)
-        + futureLoss * 20
-        + nearLoss * 18
-        + appendLoss * 8
-        + Math.max(0, touchedGroups - 1) * 10
-        + fragileIncrease * 24
-        + futureMobilityLoss * 12
-        + 20;
-      const playAbandonPenalty = 26
-        + Math.max(0, bestMove.futureMobility || 0) * 2
-        + Math.max(0, bestMove.stableGroups || 0) * 4
-        + Math.max(0, openingScore - 30) * 4;
-      const move = chooseIfStrongEnough("hold-opening", structuralCost, playAbandonPenalty);
+      const move = chooseIfStrongEnough("hold-opening", {
+        openingHoldUsedBefore: gameState.openingHoldDrawUsed?.[gameState.turnIndex] || 0
+      });
       if (move) return move;
     }
   }
@@ -554,18 +856,19 @@ RummyAI.chooseStrategicDraw = function(gameState, bestMove, level) {
     futureMobilityLoss > 0
   ].filter(Boolean).length;
   if (preserveSignals >= 2) {
-    const structuralCost = (usesRackJoker ? 28 : 0)
-      + futureLoss * 20
-      + nearLoss * 18
-      + appendLoss * 10
-      + Math.max(0, touchedGroups - 1) * 10
-      + fragileIncrease * 24
-      + futureMobilityLoss * 12;
-    const playAbandonPenalty = 26
-      + Math.max(0, bestMove.futureMobility || 0) * 3
-      + Math.max(0, bestMove.stableGroups || 0) * 4
-      + ((bestMove.type === "append" && (bestMove.stats?.rearrangeCount || 0) === 0) ? 14 : 0);
-    const move = chooseIfStrongEnough("preserve-shape", structuralCost, playAbandonPenalty);
+    const move = chooseIfStrongEnough("preserve-shape");
+    if (move) return move;
+  }
+
+  if (
+    level >= 6
+    && beforeDraw.exactCompletionKeys.length > 0
+    && beforeDraw.usefulRemaining > 0
+    && beforeDraw.deadKeys < beforeDraw.usefulKeysCount
+  ) {
+    const move = chooseIfStrongEnough("fish-completion", {
+      deadKeys: beforeDraw.deadKeys
+    });
     if (move) return move;
   }
 

@@ -6,6 +6,10 @@ class AIBridge {
     this.ready = false;
     this.available = false;
     this.lastError = null;
+    this.requestTimeoutMs = {
+      chooseMove: 5000,
+      getHint: 5000
+    };
     this._initWorker();
   }
 
@@ -21,6 +25,45 @@ class AIBridge {
     this.ready = false;
     this.available = false;
     this.lastError = error instanceof Error ? error : new Error(String(error || "Worker unavailable"));
+  }
+
+  _clearPendingEntry(id) {
+    const pending = this.pending.get(id);
+    if (!pending) return null;
+    if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
+    this.pending.delete(id);
+    return pending;
+  }
+
+  _rejectAllPending(error) {
+    const workerError = error instanceof Error ? error : new Error(String(error || "Worker unavailable"));
+    this.pending.forEach((pending, id) => {
+      const entry = this._clearPendingEntry(id);
+      if (!entry) return;
+      entry.reject(workerError);
+    });
+  }
+
+  _restartWorker(error) {
+    const workerError = error instanceof Error ? error : new Error(String(error || "Worker unavailable"));
+    this._rejectAllPending(workerError);
+    this._teardownWorker();
+    this._markUnavailable(workerError);
+    this._initWorker();
+  }
+
+  _getRequestTimeoutMs(type) {
+    return this.requestTimeoutMs[type] || 5000;
+  }
+
+  _startRequestTimeout(id, type) {
+    return setTimeout(() => {
+      if (!this.pending.has(id)) return;
+      const label = type === "chooseMove" ? "AI move" : "Hint";
+      const error = new Error(`${label} request timed out`);
+      console.error(error.message);
+      this._restartWorker(error);
+    }, this._getRequestTimeoutMs(type));
   }
 
   _initWorker() {
@@ -46,9 +89,8 @@ class AIBridge {
         return;
       }
 
-      const pending = this.pending.get(id);
+      const pending = this._clearPendingEntry(id);
       if (!pending) return;
-      this.pending.delete(id);
 
       if (type === "error") {
         pending.reject(new Error(message));
@@ -67,10 +109,7 @@ class AIBridge {
 
     this.worker.onerror = (event) => {
       console.error("AI Worker crashed:", event);
-      this.pending.forEach(({ reject }) => reject(new Error("Worker crashed")));
-      this.pending.clear();
-      this._teardownWorker();
-      this._markUnavailable(new Error("Worker crashed"));
+      this._restartWorker(new Error("Worker crashed"));
     };
 
     return true;
@@ -98,12 +137,15 @@ class AIBridge {
         return;
       }
 
-      this.pending.set(id, { resolve, reject });
+      this.pending.set(id, {
+        resolve,
+        reject,
+        timeoutHandle: this._startRequestTimeout(id, "chooseMove")
+      });
       try {
         this.worker.postMessage({ type: "chooseMove", id, stateVersion, gameState, aiLevel });
       } catch (error) {
-        this.pending.delete(id);
-        reject(error);
+        this._restartWorker(error);
       }
     });
   }
@@ -116,19 +158,21 @@ class AIBridge {
         return;
       }
 
-      this.pending.set(id, { resolve, reject });
+      this.pending.set(id, {
+        resolve,
+        reject,
+        timeoutHandle: this._startRequestTimeout(id, "getHint")
+      });
       try {
         this.worker.postMessage({ type: "getHint", id, stateVersion, gameState });
       } catch (error) {
-        this.pending.delete(id);
-        reject(error);
+        this._restartWorker(error);
       }
     });
   }
 
   cancelPending() {
-    this.pending.forEach(({ reject }) => reject(new Error("Cancelled")));
-    this.pending.clear();
+    this._rejectAllPending(new Error("Cancelled"));
     this._initWorker();
   }
 }

@@ -97,6 +97,10 @@ class AILevel3Strategy extends AIBaseStrategy {
     super(3, {
       maxDepth: 4,
       beamWidth: 18,
+      searchSchedule: [
+        { maxDepth: 3, beamWidth: 10 },
+        { maxDepth: 4, beamWidth: 18 }
+      ],
       maxBranchesPerState: 20,
       maxRackGroupBranches: 16,
       maxAppendBranches: 14,
@@ -159,6 +163,10 @@ class AILevel4Strategy extends AIBaseStrategy {
     super(4, {
       maxDepth: 4,
       beamWidth: 20,
+      searchSchedule: [
+        { maxDepth: 3, beamWidth: 12 },
+        { maxDepth: 4, beamWidth: 20 }
+      ],
       maxBranchesPerState: 22,
       maxRackGroupBranches: 16,
       maxAppendBranches: 14,
@@ -226,6 +234,11 @@ class AILevel5Strategy extends AIBaseStrategy {
     super(5, {
       maxDepth: 5,
       beamWidth: 30,
+      searchSchedule: [
+        { maxDepth: 3, beamWidth: 14 },
+        { maxDepth: 4, beamWidth: 22 },
+        { maxDepth: 5, beamWidth: 30 }
+      ],
       maxBranchesPerState: 26,
       maxRackGroupBranches: 18,
       maxAppendBranches: 16,
@@ -349,6 +362,11 @@ class AILevel5Strategy extends AIBaseStrategy {
   }
 
   evaluateState(state, ctx, terminal) {
+    const cacheKey = this.getEvalCacheKey(state, terminal, "level5");
+    if (ctx.evalCache.has(cacheKey)) {
+      return ctx.evalCache.get(cacheKey);
+    }
+
     let score = super.evaluateState(state, ctx, terminal);
     const w = this.config.weights;
     const rackReduction = ctx.initialRackSize - state.rack.length;
@@ -380,6 +398,7 @@ class AILevel5Strategy extends AIBaseStrategy {
       score += potential.nearCompleteCount * (w.nearComplete || 0);
     }
 
+    ctx.evalCache.set(cacheKey, score);
     return score;
   }
 }
@@ -389,6 +408,11 @@ class AILevel6Strategy extends AIBaseStrategy {
     super(6, {
       maxDepth: 5,
       beamWidth: 32,
+      searchSchedule: [
+        { maxDepth: 3, beamWidth: 16 },
+        { maxDepth: 4, beamWidth: 24 },
+        { maxDepth: 5, beamWidth: 32 }
+      ],
       maxBranchesPerState: 28,
       maxRackGroupBranches: 18,
       maxAppendBranches: 16,
@@ -613,6 +637,11 @@ class AILevel6Strategy extends AIBaseStrategy {
   }
 
   evaluateState(state, ctx, terminal) {
+    const cacheKey = this.getEvalCacheKey(state, terminal, "level6");
+    if (ctx.evalCache.has(cacheKey)) {
+      return ctx.evalCache.get(cacheKey);
+    }
+
     let score = super.evaluateState(state, ctx, terminal);
     const w = this.config.weights;
     const rackReduction = ctx.initialRackSize - state.rack.length;
@@ -665,6 +694,7 @@ class AILevel6Strategy extends AIBaseStrategy {
       }
     }
 
+    ctx.evalCache.set(cacheKey, score);
     return score;
   }
 }
@@ -679,17 +709,36 @@ AILevel6Strategy.prototype.ensureAdvancedJokerChainConfig = function() {
     advancedJokerChainMaxPoolTiles: this.config.advancedJokerChainMaxPoolTiles ?? 5,
     advancedJokerChainMaxSolutions: this.config.advancedJokerChainMaxSolutions ?? 2,
     advancedJokerChainMinRackCount: this.config.advancedJokerChainMinRackCount ?? 0,
-    advancedJokerChainOnlyWhenBoosted: this.config.advancedJokerChainOnlyWhenBoosted ?? false
+    advancedJokerChainOnlyWhenBoosted: this.config.advancedJokerChainOnlyWhenBoosted ?? false,
+    advancedJokerChainDoubleSupportQuota: this.config.advancedJokerChainDoubleSupportQuota ?? 1,
+    advancedJokerChainDoubleSupportMaxSupportPlans: this.config.advancedJokerChainDoubleSupportMaxSupportPlans ?? 2,
+    advancedJokerChainDoubleSupportMaxRackSubsetSize: this.config.advancedJokerChainDoubleSupportMaxRackSubsetSize ?? 2,
+    advancedJokerChainDoubleSupportMaxPoolTiles: this.config.advancedJokerChainDoubleSupportMaxPoolTiles ?? 6,
+    advancedJokerChainDoubleSupportMaxSolutions: this.config.advancedJokerChainDoubleSupportMaxSolutions ?? 1,
+    advancedJokerChainOnlyWhenEmergency: this.config.advancedJokerChainOnlyWhenEmergency ?? true,
+    advancedJokerChainMinRemainingTimeMs: this.config.advancedJokerChainMinRemainingTimeMs ?? 180
   };
 };
 
 AILevel6Strategy.prototype.shouldUseAdvancedJokerChain = function(state, ctx) {
   this.ensureAdvancedJokerChainConfig();
   if (this.isTimedOut(ctx)) return false;
+  if (this.getRemainingTimeMs(ctx) < (this.config.advancedJokerChainMinRemainingTimeMs || 0)) return false;
   if ((this.config.maxTouchedGroups || 0) < 3) return false;
   if (!state.opened) return false;
-  if (state.table.length < 3) return false;
+  if (state.table.length < 4) return false;
   if (state.rack.length < (this.config.advancedJokerChainMinRackCount || 0)) return false;
+
+  const opponentRacks = ctx.gameState.playersMeta
+    .filter((_, index) => index !== ctx.gameState.turnIndex)
+    .map(player => player.rackCount);
+  const smallestOpponentRack = opponentRacks.length > 0 ? Math.min(...opponentRacks) : Infinity;
+  const endgamePressure = smallestOpponentRack <= 4 || state.rack.length <= 6;
+
+  if (this.config.advancedJokerChainOnlyWhenEmergency) {
+    if (!(state.rack.length <= 8 || smallestOpponentRack <= 4)) return false;
+    if (!((ctx.gameState.bagCount || 0) <= 16 || endgamePressure)) return false;
+  }
 
   const hasSingleJokerSource = state.table.some(group => {
     const jokerCount = group.filter(tile => tile.joker).length;
@@ -699,11 +748,6 @@ AILevel6Strategy.prototype.shouldUseAdvancedJokerChain = function(state, ctx) {
   if (!hasSingleJokerSource) return false;
 
   if (!this.config.advancedJokerChainOnlyWhenBoosted) return true;
-
-  const opponentRacks = ctx.gameState.playersMeta
-    .filter((_, index) => index !== ctx.gameState.turnIndex)
-    .map(player => player.rackCount);
-  const smallestOpponentRack = opponentRacks.length > 0 ? Math.min(...opponentRacks) : Infinity;
   return state.rack.length <= 8 || smallestOpponentRack <= 5 || (ctx.gameState.bagCount || 0) <= 18;
 };
 
@@ -831,6 +875,167 @@ AILevel6Strategy.prototype.generateAdvancedJokerChainMoves = function(state, ctx
   return candidates;
 };
 
+AILevel6Strategy.prototype.generateDoubleSupportJokerChainMoves = function(state, ctx) {
+  this.ensureAdvancedJokerChainConfig();
+  if (this.getRemainingTimeMs(ctx) < (this.config.advancedJokerChainMinRemainingTimeMs || 0)) {
+    return [];
+  }
+
+  const candidates = [];
+  const maxSupportPlans = this.config.advancedJokerChainDoubleSupportMaxSupportPlans || 2;
+  const maxRackSubsetSize = this.config.advancedJokerChainDoubleSupportMaxRackSubsetSize || 2;
+  const maxPoolTiles = this.config.advancedJokerChainDoubleSupportMaxPoolTiles || 6;
+  const maxSolutions = this.config.advancedJokerChainDoubleSupportMaxSolutions || 1;
+
+  const requiresSupportTile = (pool, jokerId, removedSupportId) => {
+    const reducedPool = pool.filter(tile => tile.id !== removedSupportId);
+    if (reducedPool.length < 3) return true;
+    const reducedSolutions = RummyAIUtils.findExactCoverPartitions(reducedPool, ctx.poolGroupCache, {
+      maxSolutions: 1
+    });
+    return !reducedSolutions.some(partition =>
+      partition.groups.some(group => group.some(tile => tile.id === jokerId))
+    );
+  };
+
+  for (let sourceIndex = 0; sourceIndex < state.table.length; sourceIndex += 1) {
+    if (this.isTimedOut(ctx)) break;
+    const sourceGroup = state.table[sourceIndex];
+    const sourceJokers = sourceGroup.filter(tile => tile.joker);
+    if (sourceJokers.length !== 1) continue;
+
+    const sourceAnalysis = RummyRules.explainGroup(sourceGroup);
+    if (!sourceAnalysis.valid || !sourceAnalysis.jokerAssignments || sourceAnalysis.jokerAssignments.length === 0) continue;
+
+    const jokerTile = sourceJokers[0];
+    const assignments = sourceAnalysis.jokerAssignments.filter(assignment => assignment.tileId === jokerTile.id);
+    for (const assignment of assignments) {
+      if (this.isTimedOut(ctx)) break;
+
+      const isExactReplacementTile = tile =>
+        !tile.joker
+        && tile.number === assignment.actsAsNumber
+        && (!assignment.actsAsColor || tile.color === assignment.actsAsColor);
+
+      for (let replacementIndex = 0; replacementIndex < state.table.length; replacementIndex += 1) {
+        if (this.isTimedOut(ctx)) break;
+        if (replacementIndex === sourceIndex) continue;
+
+        const replacementPlans = this.getRemovalPlans(state.table[replacementIndex], ctx, {
+          maxRemove: 1,
+          maxSolutions: 2,
+          allowZero: false
+        });
+
+        for (const replacementPlan of replacementPlans) {
+          if (this.isTimedOut(ctx)) break;
+          if (replacementPlan.removedTiles.length !== 1) continue;
+          const replacementDonorTile = replacementPlan.removedTiles[0];
+          if (!isExactReplacementTile(replacementDonorTile)) continue;
+
+          const substitutedGroup = normalizeGroupTiles(
+            sourceGroup
+              .filter(tile => tile.id !== jokerTile.id)
+              .concat(replacementDonorTile)
+          );
+          if (!RummyRules.explainGroup(substitutedGroup).valid) continue;
+
+          for (let supportIndexA = 0; supportIndexA < state.table.length; supportIndexA += 1) {
+            if (this.isTimedOut(ctx)) break;
+            if ([sourceIndex, replacementIndex].includes(supportIndexA)) continue;
+
+            const supportPlansA = this.getRemovalPlans(state.table[supportIndexA], ctx, {
+              maxRemove: 1,
+              maxSolutions: maxSupportPlans,
+              allowZero: false
+            });
+
+            for (const supportPlanA of supportPlansA) {
+              if (this.isTimedOut(ctx)) break;
+              if (supportPlanA.removedTiles.length !== 1) continue;
+              const supportTileA = supportPlanA.removedTiles[0];
+              if (!supportTileA || supportTileA.joker) continue;
+
+              for (let supportIndexB = supportIndexA + 1; supportIndexB < state.table.length; supportIndexB += 1) {
+                if (this.isTimedOut(ctx)) break;
+                if ([sourceIndex, replacementIndex].includes(supportIndexB)) continue;
+
+                const supportPlansB = this.getRemovalPlans(state.table[supportIndexB], ctx, {
+                  maxRemove: 1,
+                  maxSolutions: maxSupportPlans,
+                  allowZero: false
+                });
+
+                for (const supportPlanB of supportPlansB) {
+                  if (this.isTimedOut(ctx)) break;
+                  if (supportPlanB.removedTiles.length !== 1) continue;
+                  const supportTileB = supportPlanB.removedTiles[0];
+                  if (!supportTileB || supportTileB.joker) continue;
+                  if (supportTileA.id === supportTileB.id) continue;
+
+                  const rackSubsets = this.getRearrangementRackSubsets(state, ctx, [jokerTile, supportTileA, supportTileB])
+                    .filter(subset =>
+                      subset.size <= maxRackSubsetSize
+                      && !subset.ids.includes(replacementDonorTile.id)
+                    );
+
+                  for (const subset of rackSubsets) {
+                    if (this.isTimedOut(ctx)) break;
+                    const pool = [jokerTile, supportTileA, supportTileB, ...subset.tiles];
+                    if (pool.length < 3 || pool.length > maxPoolTiles) continue;
+
+                    const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
+                      maxSolutions
+                    });
+
+                    partitions.slice(0, maxSolutions).forEach(partition => {
+                      const jokerGroup = partition.groups.find(group =>
+                        group.some(tile => tile.id === jokerTile.id)
+                        && group.some(tile => tile.id === supportTileA.id)
+                        && group.some(tile => tile.id === supportTileB.id)
+                      );
+                      if (!jokerGroup) return;
+                      if (!requiresSupportTile(pool, jokerTile.id, supportTileA.id)) return;
+                      if (!requiresSupportTile(pool, jokerTile.id, supportTileB.id)) return;
+
+                      const detailText = `${sourceIndex + 1}번 조커를 ${replacementIndex + 1}번 그룹의 ${formatTileText(replacementDonorTile)}로 대체하고, ${supportIndexA + 1}번/${supportIndexB + 1}번 그룹 donor를 같이 써서 조커 연쇄를 완성합니다.`;
+                      const jokerNote = `${sourceIndex + 1}번 그룹 조커를 donor 2개와 함께 다시 활용합니다.`;
+                      const candidate = this.createRearrangedState(state, ctx, {
+                        mode: "joker-chain-double",
+                        sourceGroupIndices: [sourceIndex, replacementIndex, supportIndexA, supportIndexB],
+                        sourceTableIds: [jokerTile.id, replacementDonorTile.id, supportTileA.id, supportTileB.id],
+                        sourceRackIds: subset.ids,
+                        retainedGroups: [
+                          substitutedGroup,
+                          ...deepCopy(replacementPlan.remainingGroups),
+                          ...deepCopy(supportPlanA.remainingGroups),
+                          ...deepCopy(supportPlanB.remainingGroups)
+                        ],
+                        createdGroups: partition.groups,
+                        detailText,
+                        jokerAssignments: partition.groups.flatMap(group => RummyRules.explainGroup(group).jokerAssignments || []),
+                        jokerNote,
+                        statBoost: {
+                          jokerRelocationCount: 1,
+                          jokerEfficiency: 4,
+                          jokerTrap: partition.groups.some(group => group.length === 3) ? 1 : 0
+                        }
+                      });
+                      if (candidate) candidates.push(candidate);
+                    });
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return candidates;
+};
+
 AILevel6Strategy.prototype.generateRearrangementMoves = function(state, ctx) {
   this.ensureAdvancedJokerChainConfig();
   const baseMoves = AIBaseStrategy.prototype.generateRearrangementMoves.call(this, state, ctx);
@@ -843,9 +1048,14 @@ AILevel6Strategy.prototype.generateRearrangementMoves = function(state, ctx) {
     ctx,
     this.config.advancedJokerChainQuota || 0
   );
+  const doubleSupportMoves = this.pickQuota(
+    this.generateDoubleSupportJokerChainMoves(state, ctx),
+    ctx,
+    this.config.advancedJokerChainDoubleSupportQuota || 0
+  );
 
   return this.dedupeAndSortCandidates(
-    [...baseMoves, ...chainMoves],
+    [...baseMoves, ...chainMoves, ...doubleSupportMoves],
     ctx,
     this.config.maxRearrangeBranches
   );
