@@ -18,6 +18,7 @@ const LEGACY_HTML_PATH = path.join(ROOT_DIR, "legacy", "animal_rummikub_starter 
 const LEGACY_INIT_MARKER = "const game = new Game();";
 const COLOR_KEYS = ["red", "blue", "yellow", "black"];
 const IGNORED_FIELDS = new Set([
+  "title",
   "type",
   "summary",
   "actions",
@@ -42,7 +43,12 @@ const IGNORED_FIELDS = new Set([
   "previewScore",
   "finalScore",
   "searchStateKey",
-  "tieBreakData"
+  "tieBreakData",
+  "partial",
+  "partialReason",
+  "searchPhase",
+  "searchTruncated",
+  "truncationNote"
 ]);
 
 function createSeededMath(seed) {

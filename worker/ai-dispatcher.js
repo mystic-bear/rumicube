@@ -1,15 +1,93 @@
 class RummyAI {
-  static chooseMove(gameState, level) {
+  static annotatePartialMove(move, phase = "search") {
+    if (!move) return null;
+    const annotated = deepCopy(move);
+    annotated.searchTruncated = true;
+    annotated.partial = true;
+    annotated.partialReason = annotated.partialReason || "soft-deadline";
+    if (phase && !annotated.searchPhase) annotated.searchPhase = phase;
+    return annotated;
+  }
+
+  static isDeadlineReached(options = {}) {
+    return typeof options.softDeadlineAt === "number" && Date.now() >= options.softDeadlineAt;
+  }
+
+  static createReporterProxy(options = {}, handlers = {}) {
+    const parentReporter = options.reporter || null;
+    return {
+      ...options,
+      reporter: {
+        onProgress(payload) {
+          let nextPayload = payload;
+          if (typeof handlers.onProgress === "function") {
+            nextPayload = handlers.onProgress(payload);
+          }
+          if (nextPayload && parentReporter?.onProgress) {
+            parentReporter.onProgress(nextPayload);
+          }
+        },
+        onMeta(payload) {
+          if (typeof handlers.onMeta === "function") {
+            handlers.onMeta(payload);
+          }
+          if (parentReporter?.onMeta) {
+            parentReporter.onMeta(payload);
+          }
+        }
+      }
+    };
+  }
+
+  static chooseMove(gameState, level, options = {}) {
     const targetLevel = Math.max(1, Math.min(6, Number(level) || 1));
     let chosen = null;
     if (targetLevel < 6) {
-      chosen = this.chooseLegacy(gameState, targetLevel);
+      chosen = this.chooseLegacy(gameState, targetLevel, options);
     } else {
-      const floorMove = this.chooseLegacy(gameState, 5);
-      const expertMove = this.getStrategy(6).chooseMove(gameState);
+      let bestLegacySoFar = null;
+      let bestExpertSoFar = null;
+      let bestChosenSoFar = null;
+      let bestFinalSoFar = null;
+      const floorMove = this.chooseLegacy(
+        gameState,
+        5,
+        this.createReporterProxy(options, {
+          onProgress: (payload) => {
+            if (payload?.kind === "move" && payload.move) {
+              bestLegacySoFar = payload.move;
+            }
+            return payload;
+          }
+        })
+      );
+      if (floorMove) bestLegacySoFar = floorMove;
+      if (this.isDeadlineReached(options)) {
+        return this.annotatePartialMove(bestLegacySoFar, floorMove?.searchPhase || "legacy-5");
+      }
+
+      const expertMove = this.getStrategy(6).chooseMove(
+        gameState,
+        this.createReporterProxy(options, {
+          onProgress: (payload) => {
+            if (payload?.kind !== "move" || !payload.move) return payload;
+            bestExpertSoFar = payload.move;
+            const candidate = !floorMove || this.passesLevel6Floor(payload.move, floorMove, gameState)
+              ? payload.move
+              : floorMove;
+            bestChosenSoFar = candidate;
+            return {
+              ...payload,
+              move: this.annotatePartialMove(candidate, payload.move.searchPhase || payload.searchPhase || "expert-6"),
+              searchPhase: payload.move.searchPhase || payload.searchPhase || "expert-6"
+            };
+          }
+        })
+      );
       if (expertMove) {
         expertMove.engineLevel = 6;
         expertMove.selectedLevel = targetLevel;
+        bestExpertSoFar = expertMove;
       }
 
       if (!expertMove) {
@@ -19,10 +97,40 @@ class RummyAI {
       } else {
         chosen = this.passesLevel6Floor(expertMove, floorMove, gameState) ? expertMove : floorMove;
       }
+      bestChosenSoFar = chosen;
+      if (this.isDeadlineReached(options)) {
+        return this.annotatePartialMove(
+          bestChosenSoFar || bestLegacySoFar || bestExpertSoFar,
+          chosen?.searchPhase || expertMove?.searchPhase || floorMove?.searchPhase || "dispatcher-l6"
+        );
+      }
+
+      if (targetLevel >= 5) {
+        const drawMove = this.chooseStrategicDraw(gameState, chosen, targetLevel);
+        if (drawMove) {
+          drawMove.engineLevel = targetLevel;
+          drawMove.selectedLevel = targetLevel;
+          bestFinalSoFar = drawMove;
+        } else {
+          bestFinalSoFar = chosen;
+        }
+      }
+
+      if (bestFinalSoFar) {
+        chosen = bestFinalSoFar;
+      } else if (this.isDeadlineReached(options)) {
+        return this.annotatePartialMove(
+          bestFinalSoFar || bestChosenSoFar || bestLegacySoFar || bestExpertSoFar,
+          chosen?.searchPhase || "dispatcher-l6"
+        );
+      }
     }
     if (chosen) chosen.selectedLevel = targetLevel;
 
-    if (targetLevel >= 5) {
+    if (targetLevel >= 5 && targetLevel < 6) {
+      if (this.isDeadlineReached(options)) {
+        return this.annotatePartialMove(chosen, chosen?.searchPhase || `legacy-${targetLevel}`);
+      }
       const drawMove = this.chooseStrategicDraw(gameState, chosen, targetLevel);
       if (drawMove) {
         drawMove.engineLevel = targetLevel;
@@ -33,16 +141,17 @@ class RummyAI {
     return chosen;
   }
 
-  static chooseLegacy(gameState, targetLevel) {
+  static chooseLegacy(gameState, targetLevel, options = {}) {
     let bestMove = null;
     let bestLevel = 0;
 
     for (let currentLevel = 1; currentLevel <= targetLevel; currentLevel += 1) {
+      if (this.isDeadlineReached(options)) break;
       const strategy = this.getStrategy(currentLevel);
       const moveOptions = currentLevel === 1 && targetLevel > 1
         ? { applyBlunder: false }
         : undefined;
-      const move = strategy.chooseMove(gameState, moveOptions);
+      const move = strategy.chooseMove(gameState, { ...options, ...(moveOptions || {}) });
       if (move) move.engineLevel = currentLevel;
       if (
         move
@@ -58,11 +167,27 @@ class RummyAI {
         bestMove = move;
         bestLevel = currentLevel;
       }
+      if (bestMove) {
+        options.reporter?.onProgress?.({
+          kind: "move",
+          move: this.annotatePartialMove(bestMove, `legacy-${currentLevel}`),
+          searchPhase: `legacy-${currentLevel}`,
+          partialReason: "soft-deadline"
+        });
+      }
+      options.reporter?.onMeta?.({
+        stage: "legacy",
+        level: currentLevel,
+        bestLevel
+      });
     }
 
     if (bestMove) {
       bestMove.selectedLevel = targetLevel;
       bestMove.engineLevel = bestLevel;
+      if (this.isDeadlineReached(options)) {
+        return this.annotatePartialMove(bestMove, `legacy-${bestLevel}`);
+      }
     }
     return bestMove;
   }

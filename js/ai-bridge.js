@@ -7,8 +7,12 @@ class AIBridge {
     this.available = false;
     this.lastError = null;
     this.requestTimeoutMs = {
-      chooseMove: 5000,
-      getHint: 5000
+      chooseMove: 10000,
+      getHint: 10000
+    };
+    this.softDeadlineMs = {
+      chooseMove: 9000,
+      getHint: 9000
     };
     this._initWorker();
   }
@@ -42,12 +46,20 @@ class AIBridge {
     return pending;
   }
 
+  _attachPartialToError(error, pending) {
+    if (!pending?.lastPartial) return error;
+    if (pending.type === "chooseMove") error.partialMove = pending.lastPartial.move || null;
+    if (pending.type === "getHint") error.partialHint = pending.lastPartial.hint || null;
+    error.partialResult = pending.lastPartial;
+    return error;
+  }
+
   _rejectAllPending(error) {
-    const workerError = this._createBridgeError(error, error?.code || "worker-unavailable");
     this.pending.forEach((pending, id) => {
       const entry = this._clearPendingEntry(id);
       if (!entry) return;
-      entry.reject(workerError);
+      const workerError = this._createBridgeError(error, error?.code || "worker-unavailable");
+      entry.reject(this._attachPartialToError(workerError, entry));
     });
   }
 
@@ -60,18 +72,41 @@ class AIBridge {
   }
 
   _getRequestTimeoutMs(type) {
-    return this.requestTimeoutMs[type] || 5000;
+    return this.requestTimeoutMs[type] || 10000;
+  }
+
+  _getSoftDeadlineMs(type) {
+    return this.softDeadlineMs[type] || Math.max(1000, this._getRequestTimeoutMs(type) - 1000);
   }
 
   _startRequestTimeout(id, type) {
     return setTimeout(() => {
-      if (!this.pending.has(id)) return;
+      const pending = this.pending.get(id);
+      if (!pending) return;
       const label = type === "chooseMove" ? "AI move" : "Hint";
       const code = type === "chooseMove" ? "choose-move-timeout" : "hint-timeout";
       const error = this._createBridgeError(`${label} request timed out`, code);
       console.error(error.message);
+
+      if (pending.lastPartial) {
+        const entry = this._clearPendingEntry(id);
+        if (!entry) return;
+        entry.resolvedFromPartial = true;
+        entry.resolve({
+          ...entry.lastPartial,
+          timedOut: true
+        });
+        this._restartWorker(error);
+        return;
+      }
+
       this._restartWorker(error);
     }, this._getRequestTimeoutMs(type));
+  }
+
+  _cachePartial(pending, payload) {
+    if (!pending || !payload) return;
+    pending.lastPartial = payload;
   }
 
   _initWorker() {
@@ -90,28 +125,57 @@ class AIBridge {
     this.lastError = null;
 
     this.worker.onmessage = (event) => {
-      const { type, id, stateVersion, move, hint, message } = event.data;
+      const { type, id, stateVersion, move, hint, message, code, progressMeta } = event.data;
 
       if (type === "ready") {
         this.ready = true;
         return;
       }
 
-      const pending = this._clearPendingEntry(id);
+      const pending = this.pending.get(id);
       if (!pending) return;
 
+      if (type === "progress") {
+        pending.progressMeta = progressMeta || event.data;
+        return;
+      }
+
+      if (type === "partialMove") {
+        this._cachePartial(pending, {
+          move,
+          stateVersion,
+          partial: true,
+          searchTruncated: true
+        });
+        return;
+      }
+
+      if (type === "partialHint") {
+        this._cachePartial(pending, {
+          hint,
+          stateVersion,
+          partial: true,
+          searchTruncated: true
+        });
+        return;
+      }
+
+      const entry = this._clearPendingEntry(id);
+      if (!entry) return;
+
       if (type === "error") {
-        pending.reject(new Error(message));
+        const workerError = this._createBridgeError(message || "Worker request failed", code || "worker-error");
+        entry.reject(this._attachPartialToError(workerError, entry));
         return;
       }
 
       if (type === "moveResult") {
-        pending.resolve({ move, stateVersion });
+        entry.resolve({ move, stateVersion });
         return;
       }
 
       if (type === "hintResult") {
-        pending.resolve({ hint, stateVersion });
+        entry.resolve({ hint, stateVersion });
       }
     };
 
@@ -137,6 +201,19 @@ class AIBridge {
     return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
 
+  _createPendingEntry(id, type, stateVersion, resolve, reject) {
+    return {
+      resolve,
+      reject,
+      timeoutHandle: this._startRequestTimeout(id, type),
+      type,
+      stateVersion,
+      lastPartial: null,
+      progressMeta: null,
+      resolvedFromPartial: false
+    };
+  }
+
   chooseMove(gameState, aiLevel, stateVersion) {
     const id = this._createRequestId("move");
     return new Promise((resolve, reject) => {
@@ -145,13 +222,18 @@ class AIBridge {
         return;
       }
 
-      this.pending.set(id, {
-        resolve,
-        reject,
-        timeoutHandle: this._startRequestTimeout(id, "chooseMove")
-      });
+      this.pending.set(id, this._createPendingEntry(id, "chooseMove", stateVersion, resolve, reject));
       try {
-        this.worker.postMessage({ type: "chooseMove", id, stateVersion, gameState, aiLevel });
+        this.worker.postMessage({
+          type: "chooseMove",
+          id,
+          stateVersion,
+          gameState,
+          aiLevel,
+          budgetMs: this._getRequestTimeoutMs("chooseMove"),
+          softDeadlineMs: this._getSoftDeadlineMs("chooseMove"),
+          allowPartial: true
+        });
       } catch (error) {
         this._restartWorker(error);
       }
@@ -166,13 +248,17 @@ class AIBridge {
         return;
       }
 
-      this.pending.set(id, {
-        resolve,
-        reject,
-        timeoutHandle: this._startRequestTimeout(id, "getHint")
-      });
+      this.pending.set(id, this._createPendingEntry(id, "getHint", stateVersion, resolve, reject));
       try {
-        this.worker.postMessage({ type: "getHint", id, stateVersion, gameState });
+        this.worker.postMessage({
+          type: "getHint",
+          id,
+          stateVersion,
+          gameState,
+          budgetMs: this._getRequestTimeoutMs("getHint"),
+          softDeadlineMs: this._getSoftDeadlineMs("getHint"),
+          allowPartial: true
+        });
       } catch (error) {
         this._restartWorker(error);
       }

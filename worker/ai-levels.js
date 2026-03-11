@@ -39,7 +39,7 @@ class AILevel1Strategy extends AIBaseStrategy {
   }
 
   chooseMove(gameState, options = {}) {
-    const move = super.chooseMove(gameState);
+    const move = super.chooseMove(gameState, options);
     if (!move) return null;
     if ((move.rackReduction || 0) >= gameState.currentPlayer.rack.length) return move;
     if (options.applyBlunder !== false && Math.random() < (this.config.blunderRate || 0)) return null;
@@ -273,10 +273,16 @@ class AILevel5Strategy extends AIBaseStrategy {
       jokerRelocationQuota: 4,
       exactQuota: 3,
       protectedRackSubsets: true,
+      complexityCaps: {
+        largeRackThreshold: 16,
+        veryLargeRackThreshold: 20,
+        crowdedTableThreshold: 8,
+        unopenedLargeRackThreshold: 15
+      },
       conditionalSubsetExhaustive: true,
       exhaustiveRackThreshold: 10,
       exhaustivePoolThreshold: 10,
-      timeLimitMs: 500,
+      timeLimitMs: 750,
       weights: {
         rackReduction: 150,
         actionScore: 1.45,
@@ -317,7 +323,10 @@ class AILevel5Strategy extends AIBaseStrategy {
     const rackGroups = RummyAIUtils.getValidGroupsFromTiles(
       state.rack,
       ctx.rackGroupCache,
-      state.rack.length
+      {
+        maxSize: state.rack.length,
+        ctx
+      }
     );
     const usedIds = new Set();
     let futureRackReduction = 0;
@@ -447,10 +456,16 @@ class AILevel6Strategy extends AIBaseStrategy {
       jokerRelocationQuota: 4,
       exactQuota: 4,
       protectedRackSubsets: true,
+      complexityCaps: {
+        largeRackThreshold: 16,
+        veryLargeRackThreshold: 20,
+        crowdedTableThreshold: 8,
+        unopenedLargeRackThreshold: 15
+      },
       conditionalSubsetExhaustive: true,
       exhaustiveRackThreshold: 10,
       exhaustivePoolThreshold: 10,
-      timeLimitMs: 600,
+      timeLimitMs: 900,
       weights: {
         rackReduction: 150,
         actionScore: 1.45,
@@ -490,14 +505,14 @@ class AILevel6Strategy extends AIBaseStrategy {
     });
   }
 
-  chooseMove(gameState) {
+  chooseMove(gameState, options = {}) {
     const rackCount = gameState.currentPlayer.rack.length;
     const opponentRacks = gameState.playersMeta
       .filter((_, index) => index !== gameState.turnIndex)
       .map(player => player.rackCount);
     const smallestOpponentRack = opponentRacks.length > 0 ? Math.min(...opponentRacks) : Infinity;
     const shouldBoostEndgame = rackCount <= 7 || smallestOpponentRack <= 4;
-    if (!shouldBoostEndgame) return super.chooseMove(gameState);
+    if (!shouldBoostEndgame) return super.chooseMove(gameState, options);
     const shouldUseEmergencyBoost = rackCount <= 4 || smallestOpponentRack <= 2;
 
     const previousConfig = this.config;
@@ -505,12 +520,12 @@ class AILevel6Strategy extends AIBaseStrategy {
       ...previousConfig,
       exactQuota: Math.max(previousConfig.exactQuota || 0, shouldUseEmergencyBoost ? 8 : 7),
       maxRearrangeBranches: Math.max(previousConfig.maxRearrangeBranches || 0, shouldUseEmergencyBoost ? 32 : 30),
-      timeLimitMs: Math.max(previousConfig.timeLimitMs || 0, shouldUseEmergencyBoost ? 900 : 850),
+      timeLimitMs: Math.max(previousConfig.timeLimitMs || 0, shouldUseEmergencyBoost ? 1350 : 1275),
       maxPoolTiles: Math.max(previousConfig.maxPoolTiles || 0, 14)
     };
 
     try {
-      return super.chooseMove(gameState);
+      return super.chooseMove(gameState, options);
     } finally {
       this.config = previousConfig;
     }
@@ -520,7 +535,10 @@ class AILevel6Strategy extends AIBaseStrategy {
     const rackGroups = RummyAIUtils.getValidGroupsFromTiles(
       state.rack,
       ctx.rackGroupCache,
-      state.rack.length
+      {
+        maxSize: state.rack.length,
+        ctx
+      }
     );
     const usedIds = new Set();
     let futureRackReduction = 0;
@@ -829,7 +847,8 @@ AILevel6Strategy.prototype.generateAdvancedJokerChainMoves = function(state, ctx
                 if (pool.length < 3 || pool.length > maxPoolTiles) continue;
 
                 const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
-                  maxSolutions
+                  maxSolutions,
+                  ctx
                 });
 
                 partitions.slice(0, maxSolutions).forEach(partition => {
@@ -891,7 +910,8 @@ AILevel6Strategy.prototype.generateDoubleSupportJokerChainMoves = function(state
     const reducedPool = pool.filter(tile => tile.id !== removedSupportId);
     if (reducedPool.length < 3) return true;
     const reducedSolutions = RummyAIUtils.findExactCoverPartitions(reducedPool, ctx.poolGroupCache, {
-      maxSolutions: 1
+      maxSolutions: 1,
+      ctx
     });
     return !reducedSolutions.some(partition =>
       partition.groups.some(group => group.some(tile => tile.id === jokerId))
@@ -985,7 +1005,8 @@ AILevel6Strategy.prototype.generateDoubleSupportJokerChainMoves = function(state
                     if (pool.length < 3 || pool.length > maxPoolTiles) continue;
 
                     const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
-                      maxSolutions
+                      maxSolutions,
+                      ctx
                     });
 
                     partitions.slice(0, maxSolutions).forEach(partition => {

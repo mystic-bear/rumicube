@@ -249,6 +249,9 @@ const ui = {
   },
   showHint(hint) {
     const parts = [];
+    if (hint.searchTruncated && hint.truncationNote) {
+      parts.push(`<div class="hint-reason">${hint.truncationNote}</div>`);
+    }
     const labelParts = [hint.shortText, hint.summary]
       .filter(Boolean)
       .filter((value, index, list) => list.indexOf(value) === index);

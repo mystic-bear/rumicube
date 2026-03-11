@@ -4,15 +4,17 @@ class AIBaseStrategy {
     this.config = config;
   }
 
-  chooseMove(gameState) {
+  chooseMove(gameState, options = {}) {
     const initialState = this.createInitialState(gameState);
-    const ctx = this.createSearchContext(gameState, initialState);
+    const ctx = this.createSearchContext(gameState, initialState, options);
     const searchSchedule = this.buildSearchSchedule(gameState, ctx);
     let best = null;
     let emergencyBest = null;
+    let completedAllPasses = true;
 
     for (const passConfig of searchSchedule) {
       if (this.isTimedOut(ctx)) break;
+      ctx.searchPhase = `beam-d${passConfig.maxDepth}-b${passConfig.beamWidth}`;
 
       const passResult = this.runBeamPass(initialState, ctx, passConfig);
       if (!emergencyBest && passResult.best) {
@@ -23,18 +25,38 @@ class AIBaseStrategy {
         if (passResult.best && (!best || this.compareCandidateOrder(passResult.best, best, ctx, "finalScore") < 0)) {
           best = passResult.best;
         }
+        if (best) {
+          this.reportProgress(
+            ctx,
+            {
+              kind: "move",
+              move: this.buildProgressMove(best, ctx, `pass-d${passConfig.maxDepth}`),
+              searchPhase: `pass-d${passConfig.maxDepth}`,
+              partialReason: "soft-deadline"
+            },
+            true
+          );
+        }
         continue;
       }
 
       if (!best && passResult.best) {
         emergencyBest = passResult.best;
       }
+      completedAllPasses = false;
       break;
     }
 
     const finalBest = best || emergencyBest;
     if (!finalBest) return null;
-    return this.buildMove(finalBest, ctx);
+    const move = this.buildMove(finalBest, ctx);
+    if (!completedAllPasses || ctx.truncatedReason) {
+      move.searchTruncated = true;
+      move.partial = true;
+      move.partialReason = ctx.truncatedReason || "soft-deadline";
+      move.searchPhase = move.searchPhase || ctx.searchPhase || "beam-search";
+    }
+    return move;
   }
 
   createInitialState(gameState) {
@@ -64,10 +86,19 @@ class AIBaseStrategy {
     };
   }
 
-  createSearchContext(gameState, initialState) {
+  createSearchContext(gameState, initialState, options = {}) {
+    const startedAt = Date.now();
+    const fallbackDeadline = this.config.timeLimitMs ? startedAt + this.config.timeLimitMs : Infinity;
     return {
       gameState,
-      startedAt: Date.now(),
+      startedAt,
+      deadlineAt: typeof options.softDeadlineAt === "number" ? options.softDeadlineAt : fallbackDeadline,
+      hardBudgetMs: options.budgetMs || null,
+      allowPartial: options.allowPartial !== false,
+      reporter: options.reporter || null,
+      truncatedReason: null,
+      progressThrottleAt: 0,
+      searchPhase: null,
       rackGroupCache: new Map(),
       poolGroupCache: new Map(),
       transpositionTable: new Map(),
@@ -77,6 +108,23 @@ class AIBaseStrategy {
       initialTableSize: initialState.table.length,
       initialJokerCount: initialState.rack.filter(tile => tile.joker).length
     };
+  }
+
+  buildProgressMove(state, ctx, phase) {
+    const move = this.buildMove(state, ctx);
+    move.searchTruncated = true;
+    move.partial = true;
+    move.partialReason = ctx.truncatedReason || "soft-deadline";
+    move.searchPhase = phase || ctx.searchPhase || "beam-search";
+    return move;
+  }
+
+  reportProgress(ctx, payload, force = false) {
+    if (!ctx.allowPartial || !ctx.reporter?.onProgress || !payload) return;
+    const now = Date.now();
+    if (!force && now < ctx.progressThrottleAt) return;
+    ctx.progressThrottleAt = now + 80;
+    ctx.reporter.onProgress(payload);
   }
 
   buildSearchSchedule(gameState, ctx) {
@@ -114,6 +162,7 @@ class AIBaseStrategy {
 
     for (let depth = 1; depth <= passConfig.maxDepth; depth += 1) {
       if (this.isTimedOut(ctx)) {
+        ctx.truncatedReason = ctx.truncatedReason || "soft-deadline";
         completed = false;
         break;
       }
@@ -123,6 +172,7 @@ class AIBaseStrategy {
         const candidates = this.generateCandidates(state, ctx);
         for (const candidate of candidates) {
           if (this.isTimedOut(ctx)) {
+            ctx.truncatedReason = ctx.truncatedReason || "soft-deadline";
             completed = false;
             break;
           }
@@ -141,6 +191,12 @@ class AIBaseStrategy {
             candidate.finalScore = this.evaluateState(candidate, ctx, true);
             if (!best || this.compareCandidateOrder(candidate, best, ctx, "finalScore") < 0) {
               best = candidate;
+              this.reportProgress(ctx, {
+                kind: "move",
+                move: this.buildProgressMove(candidate, ctx, `beam-d${depth}`),
+                searchPhase: `beam-d${depth}`,
+                partialReason: "soft-deadline"
+              });
             }
           }
           nextFrontier.push(candidate);
@@ -211,12 +267,67 @@ class AIBaseStrategy {
   }
 
   getRemainingTimeMs(ctx) {
-    if (!this.config.timeLimitMs) return Infinity;
-    return Math.max(0, this.config.timeLimitMs - (Date.now() - ctx.startedAt));
+    if (typeof ctx.deadlineAt !== "number") {
+      if (!this.config.timeLimitMs) return Infinity;
+      return Math.max(0, this.config.timeLimitMs - (Date.now() - ctx.startedAt));
+    }
+    return Math.max(0, ctx.deadlineAt - Date.now());
   }
 
   isTimedOut(ctx) {
-    return this.config.timeLimitMs && (Date.now() - ctx.startedAt) >= this.config.timeLimitMs;
+    if (typeof ctx.deadlineAt === "number") {
+      if (Date.now() >= ctx.deadlineAt) {
+        ctx.truncatedReason = ctx.truncatedReason || "soft-deadline";
+        return true;
+      }
+      return false;
+    }
+    if (!this.config.timeLimitMs) return false;
+    const timedOut = (Date.now() - ctx.startedAt) >= this.config.timeLimitMs;
+    if (timedOut) ctx.truncatedReason = ctx.truncatedReason || "soft-deadline";
+    return timedOut;
+  }
+
+  buildEffectiveConfig(state, ctx) {
+    const caps = this.config.complexityCaps || {};
+    const effective = { ...this.config };
+    const largeRackThreshold = caps.largeRackThreshold || 16;
+    const veryLargeRackThreshold = caps.veryLargeRackThreshold || 20;
+    const crowdedTableThreshold = caps.crowdedTableThreshold || 8;
+    const unopenedLargeRackThreshold = caps.unopenedLargeRackThreshold || 15;
+
+    if (state.rack.length >= largeRackThreshold) {
+      effective.maxRackTilesForRearrange = Math.min(effective.maxRackTilesForRearrange || 4, 3);
+    }
+    if (state.rack.length >= veryLargeRackThreshold) {
+      effective.maxRackSubsetBranches = Math.max(6, Math.floor((effective.maxRackSubsetBranches || 24) * 0.7));
+      effective.maxPoolTiles = Math.min(effective.maxPoolTiles || 12, 10);
+    }
+    if (this.isOpeningPending(ctx) && !state.opened && state.rack.length >= unopenedLargeRackThreshold) {
+      if (typeof effective.exactQuota === "number") effective.exactQuota = Math.min(effective.exactQuota, 1);
+      if (typeof effective.advancedJokerChainQuota === "number") effective.advancedJokerChainQuota = 0;
+      if (typeof effective.advancedJokerChainDoubleSupportQuota === "number") effective.advancedJokerChainDoubleSupportQuota = 0;
+    }
+    if (state.table.length >= crowdedTableThreshold) {
+      effective.maxTouchedGroups = Math.min(effective.maxTouchedGroups || 2, 2);
+      effective.maxPartitionSolutions = Math.min(effective.maxPartitionSolutions || 4, 2);
+      effective.maxPartitionSolutionsBridge = Math.min(
+        effective.maxPartitionSolutionsBridge || effective.maxPartitionSolutions || 4,
+        2
+      );
+    }
+    return effective;
+  }
+
+  withEffectiveConfig(state, ctx, work) {
+    const previousConfig = this.config;
+    const nextConfig = this.buildEffectiveConfig(state, ctx);
+    this.config = nextConfig;
+    try {
+      return work(nextConfig);
+    } finally {
+      this.config = previousConfig;
+    }
   }
 
   modeEnabled(mode) {
@@ -367,7 +478,10 @@ class AIBaseStrategy {
   }
 
   getProtectedRackSubsets(state, ctx, tableTiles = []) {
-    const all = RummyAIUtils.enumerateRackSubsets(state.rack, this.config.maxRackTilesForRearrange || 0);
+    const all = RummyAIUtils.enumerateRackSubsets(state.rack, {
+      maxSize: this.config.maxRackTilesForRearrange || 0,
+      ctx
+    });
     if (!this.config.protectedRackSubsets) return all;
 
     const tableIds = new Set(tableTiles.map(tile => tile.id));
@@ -385,9 +499,12 @@ class AIBaseStrategy {
       let bridgeable = false;
       let jokerCompletable = false;
       let jokerReplaceable = false;
-      if (tableTiles.length > 0) {
-        const pool = [...subset.tiles, ...tableTiles];
-        const validGroups = RummyAIUtils.getValidGroupsFromTiles(pool, ctx.poolGroupCache, pool.length);
+        if (tableTiles.length > 0) {
+          const pool = [...subset.tiles, ...tableTiles];
+          const validGroups = RummyAIUtils.getValidGroupsFromTiles(pool, ctx.poolGroupCache, {
+            maxSize: pool.length,
+            ctx
+          });
         bridgeable = validGroups.some(group =>
           subset.ids.every(id => group.ids.includes(id)) &&
           group.ids.some(id => tableIds.has(id))
@@ -426,11 +543,15 @@ class AIBaseStrategy {
       && state.rack.length <= (this.config.exhaustiveRackThreshold || 10)
       && tableTiles.length <= (this.config.exhaustivePoolThreshold || 8);
     const base = allowExhaustive
-      ? RummyAIUtils.enumerateRackSubsets(state.rack, this.config.maxRackTilesForRearrange || 0)
+      ? RummyAIUtils.enumerateRackSubsets(state.rack, {
+          maxSize: this.config.maxRackTilesForRearrange || 0,
+          ctx
+        })
       : RummyAIUtils.getRackSubsets(
           state.rack,
           this.config.maxRackTilesForRearrange || 0,
-          this.config.maxRackSubsetBranches || 24
+          this.config.maxRackSubsetBranches || 24,
+          { ctx }
         );
     const protectedSubsets = this.getProtectedRackSubsets(state, ctx, tableTiles);
     const reserve = this.config.protectedRackSubsetReserve || 0;
@@ -470,31 +591,31 @@ class AIBaseStrategy {
       });
     }
 
-    const total = 1 << group.length;
-    for (let mask = 1; mask < total; mask += 1) {
-      const removedCount = RummyAIUtils.popcount(mask);
-      if (removedCount === 0 || removedCount > maxRemove || removedCount >= group.length) continue;
-      const removedTiles = [];
-      const remainingTiles = [];
-      for (let index = 0; index < group.length; index += 1) {
-        if (mask & (1 << index)) removedTiles.push(group[index]);
-        else remainingTiles.push(group[index]);
-      }
-      if (!this.config.allowJokerRemoval && removedTiles.some(tile => tile.joker)) continue;
-      if (remainingTiles.length > 0 && remainingTiles.length < 3) continue;
+    for (let removeCount = 1; removeCount <= Math.min(maxRemove, group.length - 1); removeCount += 1) {
+      const completed = RummyAIUtils.generateKCombinations(group, removeCount, ctx, (removedTiles) => {
+        if (!this.config.allowJokerRemoval && removedTiles.some(tile => tile.joker)) return true;
+        const removedIdSet = new Set(removedTiles.map(tile => tile.id));
+        const remainingTiles = group.filter(tile => !removedIdSet.has(tile.id));
+        if (remainingTiles.length > 0 && remainingTiles.length < 3) return true;
 
-      const partitions = remainingTiles.length === 0
-        ? [{ groups: [], score: 0 }]
-        : RummyAIUtils.findExactCoverPartitions(remainingTiles, ctx.poolGroupCache, { maxSolutions });
-      if (partitions.length === 0) continue;
+        const partitions = remainingTiles.length === 0
+          ? [{ groups: [], score: 0 }]
+          : RummyAIUtils.findExactCoverPartitions(remainingTiles, ctx.poolGroupCache, {
+              maxSolutions,
+              ctx
+            });
+        if (partitions.length === 0) return true;
 
-      partitions.slice(0, maxSolutions).forEach(partition => {
-        plans.push({
-          removedTiles,
-          remainingGroups: partition.groups,
-          score: (partition.score || 0) + removedTiles.length * 12
+        partitions.slice(0, maxSolutions).forEach(partition => {
+          plans.push({
+            removedTiles,
+            remainingGroups: partition.groups,
+            score: (partition.score || 0) + removedTiles.length * 12
+          });
         });
+        return true;
       });
+      if (completed === false || this.isTimedOut(ctx)) break;
     }
 
     const seen = new Set();
@@ -603,7 +724,10 @@ class AIBaseStrategy {
     }
 
     const rackReduction = ctx.initialRackSize - state.rack.length;
-    const rackGroups = RummyAIUtils.getValidGroupsFromTiles(state.rack, ctx.rackGroupCache, state.rack.length);
+    const rackGroups = RummyAIUtils.getValidGroupsFromTiles(state.rack, ctx.rackGroupCache, {
+      maxSize: state.rack.length,
+      ctx
+    });
     const coverableIds = new Set();
     rackGroups.slice(0, 24).forEach(group => group.ids.forEach(id => coverableIds.add(id)));
     const orphanCount = state.rack.length - coverableIds.size;
@@ -701,65 +825,66 @@ class AIBaseStrategy {
   }
 
   generateCandidates(state, ctx) {
-    if (this.isOpeningPending(ctx) && !state.opened) {
-      const openingMoves = this.generateOpeningMoves(state, ctx);
-      return this.pickQuota(
-        openingMoves,
-        ctx,
-        this.config.openingQuota ?? this.config.maxBranchesPerState
-      );
-    }
+    return this.withEffectiveConfig(state, ctx, () => {
+      if (this.isOpeningPending(ctx) && !state.opened) {
+        const openingMoves = this.generateOpeningMoves(state, ctx);
+        return this.pickQuota(
+          openingMoves,
+          ctx,
+          this.config.openingQuota ?? this.config.maxBranchesPerState
+        );
+      }
 
-    const rackMoves = this.generateRackGroupMoves(state, ctx);
-    const appendMoves = this.generateAppendMoves(state, ctx);
-    const safeAppendMoves = appendMoves.filter(candidate => this.isSafeAppendCandidate(candidate));
-    const safeKeys = new Set(safeAppendMoves.map(candidate => this.getSearchStateKey(candidate)));
-    const regularAppendMoves = appendMoves.filter(candidate => !safeKeys.has(this.getSearchStateKey(candidate)));
+      const rackMoves = this.generateRackGroupMoves(state, ctx);
+      const appendMoves = this.generateAppendMoves(state, ctx);
+      const safeAppendMoves = appendMoves.filter(candidate => this.isSafeAppendCandidate(candidate));
+      const safeKeys = new Set(safeAppendMoves.map(candidate => this.getSearchStateKey(candidate)));
+      const regularAppendMoves = appendMoves.filter(candidate => !safeKeys.has(this.getSearchStateKey(candidate)));
 
-    const baselineMoves = this.dedupeAndSortCandidates([
-      ...this.pickQuota(rackMoves, ctx, this.config.newGroupQuota ?? this.config.maxBranchesPerState),
-      ...this.pickQuota(safeAppendMoves, ctx, this.config.safeAppendQuota ?? this.config.appendQuota ?? this.config.maxBranchesPerState),
-      ...this.pickQuota(regularAppendMoves, ctx, this.config.appendQuota ?? this.config.maxBranchesPerState)
-    ], ctx, this.config.maxBranchesPerState);
+      const baselineMoves = this.dedupeAndSortCandidates([
+        ...this.pickQuota(rackMoves, ctx, this.config.newGroupQuota ?? this.config.maxBranchesPerState),
+        ...this.pickQuota(safeAppendMoves, ctx, this.config.safeAppendQuota ?? this.config.appendQuota ?? this.config.maxBranchesPerState),
+        ...this.pickQuota(regularAppendMoves, ctx, this.config.appendQuota ?? this.config.maxBranchesPerState)
+      ], ctx, this.config.maxBranchesPerState);
 
-    if (!this.config.allowRearrange || !state.opened) {
-      return baselineMoves;
-    }
+      if (!this.config.allowRearrange || !state.opened) {
+        return baselineMoves;
+      }
 
-    const advancedMoves = this.generateRearrangementMoves(state, ctx);
-    return this.dedupeAndSortCandidates([
-      ...baselineMoves,
-      ...this.pickQuota(advancedMoves, ctx, this.config.rearrangeQuota ?? this.config.maxBranchesPerState)
-    ], ctx, this.config.maxBranchesPerState);
+      const advancedMoves = this.generateRearrangementMoves(state, ctx);
+      return this.dedupeAndSortCandidates([
+        ...baselineMoves,
+        ...this.pickQuota(advancedMoves, ctx, this.config.rearrangeQuota ?? this.config.maxBranchesPerState)
+      ], ctx, this.config.maxBranchesPerState);
+    });
   }
 
   generateOpeningMoves(state, ctx) {
     const groups = RummyAIUtils.getValidGroupsFromTiles(
       state.rack,
       ctx.rackGroupCache,
-      state.rack.length
-    ).slice(0, this.config.maxOpeningGroupBranches || this.config.maxRackGroupBranches || 20);
+      {
+        maxSize: state.rack.length,
+        ctx
+      }
+    )
+      .sort((a, b) => b.score - a.score || b.size - a.size || a.jokerCount - b.jokerCount)
+      .slice(0, this.config.maxOpeningGroupBranches || this.config.maxRackGroupBranches || 20);
     if (groups.length === 0) return [];
 
-    const rackIndexById = new Map(state.rack.map((tile, index) => [tile.id, index]));
-    const candidates = groups.map(group => {
-      let mask = 0;
+    const rackOrder = state.rack.map(tile => tile.id);
+    const byTileId = new Map(rackOrder.map(id => [id, []]));
+    groups.forEach(group => {
+      group.idSet = new Set(group.ids);
       group.ids.forEach(id => {
-        mask |= 1 << rackIndexById.get(id);
+        if (byTileId.has(id)) byTileId.get(id).push(group);
       });
-      return { ...group, mask };
     });
-    const byIndex = Array.from({ length: state.rack.length }, () => []);
-    candidates.forEach(candidate => {
-      for (let index = 0; index < state.rack.length; index += 1) {
-        if (candidate.mask & (1 << index)) byIndex[index].push(candidate);
-      }
-    });
-    byIndex.forEach(list => list.sort((a, b) => b.score - a.score || b.size - a.size));
-
+    byTileId.forEach(list => list.sort((a, b) => b.score - a.score || b.size - a.size || a.jokerCount - b.jokerCount));
     const seen = new Set();
     const combos = [];
     const maxSolutions = this.config.maxOpeningSolutions || 24;
+    let bestOpeningScore = 0;
 
     const recordCombo = (selected) => {
       if (selected.length === 0) return;
@@ -767,40 +892,54 @@ class AIBaseStrategy {
       const signature = serializeTableState(groupsToCreate);
       if (seen.has(signature)) return;
       seen.add(signature);
-      combos.push({
+      const combo = {
         groups: groupsToCreate,
         score: selected.reduce((sum, candidate) => sum + (candidate.score || 0), 0),
         rackReduction: selected.reduce((sum, candidate) => sum + candidate.size, 0),
         jokerCount: selected.reduce((sum, candidate) => sum + candidate.jokerCount, 0)
-      });
+      };
+      bestOpeningScore = Math.max(bestOpeningScore, combo.score);
+      combos.push(combo);
     };
 
-    const dfs = (usedMask, selected, depth) => {
+    const dfs = (usedTileIds, skippedTileIds, selected, depth) => {
       if (this.isTimedOut(ctx) || combos.length >= maxSolutions * 2) return;
       if (selected.length > 0) recordCombo(selected);
       if (depth >= (this.config.maxOpeningGroups || 1)) return;
 
-      let firstOpen = -1;
-      for (let index = 0; index < state.rack.length; index += 1) {
-        if ((usedMask & (1 << index)) === 0) {
-          firstOpen = index;
+      const optimisticGain = groups
+        .slice(0, Math.max(0, (this.config.maxOpeningGroups || 1) - depth))
+        .reduce((sum, candidate) => sum + (candidate.score || 0), 0);
+      const currentScore = selected.reduce((sum, candidate) => sum + (candidate.score || 0), 0);
+      if (currentScore < 30 && currentScore + optimisticGain < Math.max(30, bestOpeningScore)) {
+        return;
+      }
+
+      let firstOpenId = null;
+      for (const tileId of rackOrder) {
+        if (!usedTileIds.has(tileId) && !skippedTileIds.has(tileId)) {
+          firstOpenId = tileId;
           break;
         }
       }
-      if (firstOpen < 0) return;
+      if (!firstOpenId) return;
 
-      for (const candidate of byIndex[firstOpen]) {
-        if ((candidate.mask & usedMask) !== 0) continue;
+      for (const candidate of byTileId.get(firstOpenId) || []) {
+        if (candidate.ids.some(id => usedTileIds.has(id) || skippedTileIds.has(id))) continue;
+        candidate.ids.forEach(id => usedTileIds.add(id));
         selected.push(candidate);
-        dfs(usedMask | candidate.mask, selected, depth + 1);
+        dfs(usedTileIds, skippedTileIds, selected, depth + 1);
         selected.pop();
+        candidate.ids.forEach(id => usedTileIds.delete(id));
         if (this.isTimedOut(ctx) || combos.length >= maxSolutions * 2) return;
       }
 
-      dfs(usedMask | (1 << firstOpen), selected, depth);
+      skippedTileIds.add(firstOpenId);
+      dfs(usedTileIds, skippedTileIds, selected, depth);
+      skippedTileIds.delete(firstOpenId);
     };
 
-    dfs(0, [], 0);
+    dfs(new Set(), new Set(), [], 0);
 
     const ordered = combos
       .sort((a, b) =>
@@ -817,7 +956,10 @@ class AIBaseStrategy {
   }
 
   generateRackGroupMoves(state, ctx) {
-    const groups = RummyAIUtils.getValidGroupsFromTiles(state.rack, ctx.rackGroupCache, state.rack.length)
+    const groups = RummyAIUtils.getValidGroupsFromTiles(state.rack, ctx.rackGroupCache, {
+      maxSize: state.rack.length,
+      ctx
+    })
       .slice(0, this.config.maxRackGroupBranches);
     const moves = [];
 
@@ -832,10 +974,13 @@ class AIBaseStrategy {
   generateAppendMoves(state, ctx) {
     const moves = [];
     const allowBaseTable = state.opened || !ctx.gameState.ruleOptions.initial30;
+    const maxBranches = this.config.maxAppendBranches || Infinity;
 
     for (let groupIndex = 0; groupIndex < state.table.length; groupIndex += 1) {
+      if (moves.length >= maxBranches || this.isTimedOut(ctx)) break;
       if (!allowBaseTable && groupIndex < state.baseTableCount) continue;
       for (const tile of state.rack) {
+        if (moves.length >= maxBranches || this.isTimedOut(ctx)) break;
         const candidate = [...state.table[groupIndex], tile];
         const result = RummyRules.analyzeGroup(candidate);
         if (!result.valid) continue;
@@ -954,7 +1099,8 @@ class AIBaseStrategy {
             const pool = [...removedTiles, ...subset.tiles];
             if (pool.length < 3 || pool.length > (this.config.maxPoolTiles || 10)) continue;
             const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
-              maxSolutions: this.config.maxPartitionSolutionsBridge || 4
+              maxSolutions: this.config.maxPartitionSolutionsBridge || 4,
+              ctx
             });
             const removedJoker = removedTiles.find(tile => tile.joker);
             partitions.slice(0, this.config.maxPartitionSolutionsBridge || 4).forEach(partition => {
@@ -1011,7 +1157,8 @@ class AIBaseStrategy {
         if (remainingTiles.length < 3) continue;
 
         const retainedPartitions = RummyAIUtils.findExactCoverPartitions(remainingTiles, ctx.poolGroupCache, {
-          maxSolutions: 2
+          maxSolutions: 2,
+          ctx
         });
         if (retainedPartitions.length === 0) continue;
 
@@ -1138,7 +1285,8 @@ class AIBaseStrategy {
               if (pool.length < 3 || pool.length > (this.config.maxPoolTiles || 10)) continue;
 
               const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
-                maxSolutions
+                maxSolutions,
+                ctx
               });
 
               partitions.slice(0, maxSolutions).forEach(partition => {
@@ -1194,7 +1342,8 @@ class AIBaseStrategy {
         if (remainingTiles.length < 3) continue;
 
         const remainingPartitions = RummyAIUtils.findExactCoverPartitions(remainingTiles, ctx.poolGroupCache, {
-          maxSolutions: 2
+          maxSolutions: 2,
+          ctx
         });
         if (remainingPartitions.length === 0) continue;
 
@@ -1262,7 +1411,8 @@ class AIBaseStrategy {
         if (pool.length > (this.config.maxPoolTiles || 12)) continue;
 
         const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
-          maxSolutions: this.config.maxPartitionSolutions
+          maxSolutions: this.config.maxPartitionSolutions,
+          ctx
         });
 
         partitions.slice(0, this.config.maxPartitionSolutions || 6).forEach(partition => {
@@ -1464,7 +1614,8 @@ AIBaseStrategy.prototype.generateJokerSubstitutionMoves = function(state, ctx) {
             if (pool.length < 3 || pool.length > (this.config.maxPoolTiles || 10)) continue;
 
             const partitions = RummyAIUtils.findExactCoverPartitions(pool, ctx.poolGroupCache, {
-              maxSolutions
+              maxSolutions,
+              ctx
             });
 
             partitions.slice(0, maxSolutions).forEach(partition => {

@@ -875,6 +875,9 @@ Game.prototype.buildHintUnavailableHint = function(error) {
 };
 
 Game.prototype.applyHint = function(hint) {
+  if (hint.searchTruncated && !hint.truncationNote) {
+    hint.truncationNote = "Current best within the explored search window.";
+  }
   const hasAction = this.actionHistory.length > 0;
 
   if (hasAction && hint.moveType === "draw" && hint.hintSource === "strategic-draw" && !this.hasReducedRackThisTurn()) {
@@ -1033,13 +1036,20 @@ Game.prototype.performAiTurn = async function() {
     if (session.epoch !== this.asyncEpoch) return;
     if (result.stateVersion !== this.stateVersion) return;
     if (this.turn !== playerIndex || this.gameOver) return;
-
-    this.applyAiMove(result.move, playerIndex);
+    if (result.move) {
+      this.applyAiMove(result.move, playerIndex);
+      return;
+    }
+    this.fallbackAiDraw(playerIndex);
   } catch (error) {
     if (error.message === "Cancelled") return;
     console.error("AI worker error:", error);
     if (session.epoch === this.asyncEpoch && this.turn === playerIndex && !this.gameOver) {
-      this.fallbackAiDraw(playerIndex);
+      if (error.partialMove) {
+        this.applyAiMove(error.partialMove, playerIndex);
+      } else {
+        this.fallbackAiDraw(playerIndex);
+      }
     }
   } finally {
     this.finishInputLockSession(session);
@@ -1240,10 +1250,19 @@ Game.prototype.requestHint = async function() {
     if (session.epoch !== this.asyncEpoch) return;
     if (result.stateVersion !== this.stateVersion) return;
 
-    this.applyHint(result.hint);
+    if (result.hint) {
+      this.applyHint(result.hint);
+      return;
+    }
+    const unavailableHint = this.buildHintUnavailableHint(null);
+    this.presentHint(unavailableHint, this.getHintToastMessage(unavailableHint), false);
   } catch (error) {
     if (error.message === "Cancelled") return;
     console.error("Hint worker error:", error);
+    if (error.partialHint) {
+      this.applyHint(error.partialHint);
+      return;
+    }
     const unavailableHint = this.buildHintUnavailableHint(error);
     this.presentHint(unavailableHint, this.getHintToastMessage(unavailableHint), false);
   } finally {

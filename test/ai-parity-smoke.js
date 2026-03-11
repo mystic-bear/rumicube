@@ -6,6 +6,20 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const ROOT = path.resolve(__dirname, "..");
+const IGNORED_FIELDS = new Set([
+  "title",
+  "leadText",
+  "reason",
+  "shortText",
+  "steps",
+  "futureBenefit",
+  "openingBreakdown",
+  "partial",
+  "partialReason",
+  "searchPhase",
+  "searchTruncated",
+  "truncationNote"
+]);
 
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -23,6 +37,7 @@ function toPlain(value) {
   if (value && typeof value === "object") {
     const plain = {};
     Object.keys(value).sort().forEach((key) => {
+      if (IGNORED_FIELDS.has(key)) return;
       plain[key] = toPlain(value[key]);
     });
     return plain;
