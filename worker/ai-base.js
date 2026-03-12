@@ -23,6 +23,7 @@ class AIBaseStrategy {
 
       if (passResult.completed) {
         if (passResult.best && (!best || this.compareCandidateOrder(passResult.best, best, ctx, "finalScore") < 0)) {
+          this.recordExactFinalLoss(ctx, best, passResult.best, "post-pass-choice");
           best = passResult.best;
         }
         if (best) {
@@ -83,7 +84,13 @@ class AIBaseStrategy {
         chainAppendCount: 0,
         chainAppendMultiRecipient: 0,
         chainAppendSameRecipientDouble: 0,
-        chainAppendTailBuilt: 0
+        chainAppendTailBuilt: 0,
+        chainRepairFinishable: 0,
+        chainRepairRollbackUsed: 0,
+        chainRepairDonorClosed: 0,
+        chainTailClosed: 0,
+        chainTailClosedWithRack: 0,
+        chainTailClosedAfterRollback: 0
       },
       meta: {
         openingGroups: [],
@@ -115,12 +122,80 @@ class AIBaseStrategy {
         strategicDraw_chain: 0
       },
       topCandidateSeen: { exact: 0, chain: 0 },
+      chainFinishReject: {
+        tailMissing: 0,
+        leftoverFreeTiles: 0,
+        invalidRetained: 0,
+        invalidRecipient: 0,
+        noRepairFound: 0,
+        tailClosureLowPotential: 0
+      },
+      chainRepair: {
+        donorReclosed: 0,
+        recipientRollback: 0,
+        recipientRollbackTailAware: 0,
+        microTailBuilt: 0,
+        repairedFinishable: 0,
+        retainedAssistTail: 0,
+        freeOnlyTail: 0,
+        freePlusRackTail: 0
+      },
+      exactFinalLoss: {
+        lostToAppend: 0,
+        lostToSingle: 0,
+        lostToBridge: 0,
+        lostToChain: 0,
+        lostToJoker: 0,
+        lostToNonExactSameScoreBand: 0
+      },
+      exactLastLoss: {
+        seen: false,
+        phase: null,
+        exactScore: null,
+        exactRackReduction: null,
+        exactFutureMobility: null,
+        exactTouchedGroups: null,
+        exactActions: null,
+        winnerMode: null,
+        winnerScore: null,
+        winnerRackReduction: null,
+        winnerFutureMobility: null,
+        winnerTouchedGroups: null,
+        scoreGap: null
+      },
+      finalSelectionReason: {
+        exactReachedDispatcher: 0,
+        exactChosenAtDispatcher: 0,
+        exactLostAtDispatcher: 0
+      },
+      nullDetail: {
+        noGeneratedCandidates: 0,
+        noRearrangementCandidates: 0,
+        beamNoFinishable: 0,
+        timeoutNoFinishableEver: 0,
+        timeoutAfterSomeFinishable: 0,
+        openingConstraint: 0
+      },
+      timing: {
+        firstCandidateAtMs: null,
+        firstFinishableAtMs: null,
+        bestUpdateCount: 0,
+        finishableCount: 0
+      },
       _meta: {
         anyCandidates: false,
         anyFinishable: false,
-        softDeadline: false
+        softDeadline: false,
+        anyGeneratedCandidates: false,
+        anyBaselineCandidates: false,
+        anyRearrangementCandidates: false,
+        openingPending: !!gameState?.ruleOptions?.initial30 && !gameState?.currentPlayer?.opened
       }
     } : null);
+    const featureFlags = {
+      chainRepair: options.featureFlags?.chainRepair !== false,
+      exactSelectionTuning: options.featureFlags?.exactSelectionTuning !== false
+    };
     return {
       gameState,
       startedAt,
@@ -131,6 +206,7 @@ class AIBaseStrategy {
       truncatedReason: null,
       debugEnabled,
       debugStats,
+      featureFlags,
       progressThrottleAt: 0,
       searchPhase: null,
       rackGroupCache: new Map(),
@@ -167,6 +243,22 @@ class AIBaseStrategy {
     return null;
   }
 
+  getPrimaryActionMode(candidate) {
+    if (!candidate) return null;
+    const actions = candidate.actions || [];
+    if (actions.some(action => action.mode === "chain-append")) return "chain";
+    if (actions.some(action => action.mode === "exact")) return "exact";
+    if (actions.some(action => action.mode === "joker" || action.mode === "joker-gap")) return "joker";
+    if (actions.some(action => action.mode === "bridge")) return "bridge";
+    if (actions.some(action => action.mode === "single")) return "single";
+    if (actions.some(action => action.type === "append")) return "append";
+    if (actions.some(action => action.type === "new-group")) return "single";
+    if (candidate.type === "append") return "append";
+    if (candidate.type === "new-group") return "single";
+    if (candidate.type === "draw") return "draw";
+    return null;
+  }
+
   markCandidateType(ctx, candidate, bucket) {
     const type = this.getCandidateDebugType(candidate);
     if (!type) return null;
@@ -174,9 +266,73 @@ class AIBaseStrategy {
     return type;
   }
 
+  markChainReject(ctx, reason) {
+    if (!reason) return;
+    this.markDebugCount(ctx, `chainFinishReject.${reason}`);
+  }
+
+  markChainRepair(ctx, reason) {
+    if (!reason) return;
+    this.markDebugCount(ctx, `chainRepair.${reason}`);
+  }
+
+  setExactLastLoss(ctx, previousBest, nextBest, phase = "beam-best-replace") {
+    if (!ctx?.debugEnabled || !ctx.debugStats || !previousBest || !nextBest) return;
+    if (this.getCandidateDebugType(previousBest) !== "exact") return;
+    if (this.getCandidateDebugType(nextBest) === "exact") return;
+
+    const exactTieBreak = this.getCandidateTieBreakData(previousBest, ctx);
+    const winnerTieBreak = this.getCandidateTieBreakData(nextBest, ctx);
+    const exactScore = previousBest.finalScore ?? previousBest.evalScore ?? null;
+    const winnerScore = nextBest.finalScore ?? nextBest.evalScore ?? null;
+    ctx.debugStats.exactLastLoss = {
+      seen: true,
+      phase,
+      exactScore,
+      exactRackReduction: exactTieBreak.rackReduction,
+      exactFutureMobility: exactTieBreak.futureMobility,
+      exactTouchedGroups: exactTieBreak.touchedGroups,
+      exactActions: (previousBest.actions || []).map(action => action.mode || action.type || "unknown"),
+      winnerMode: this.getPrimaryActionMode(nextBest) || "unknown",
+      winnerScore,
+      winnerRackReduction: winnerTieBreak.rackReduction,
+      winnerFutureMobility: winnerTieBreak.futureMobility,
+      winnerTouchedGroups: winnerTieBreak.touchedGroups,
+      scoreGap: exactScore == null || winnerScore == null ? null : winnerScore - exactScore
+    };
+  }
+
   markSoftDeadline(ctx) {
     if (!ctx?.debugEnabled || !ctx.debugStats?._meta) return;
     ctx.debugStats._meta.softDeadline = true;
+  }
+
+  recordExactFinalLoss(ctx, previousBest, nextBest, phase = "beam-best-replace") {
+    if (!ctx?.debugEnabled || !previousBest || !nextBest) return;
+    if (this.getCandidateDebugType(previousBest) !== "exact") return;
+    if (this.getCandidateDebugType(nextBest) === "exact") return;
+
+    this.setExactLastLoss(ctx, previousBest, nextBest, phase);
+    const nextMode = this.getPrimaryActionMode(nextBest);
+    const lossKey = nextMode === "append"
+      ? "lostToAppend"
+      : nextMode === "single"
+        ? "lostToSingle"
+        : nextMode === "bridge"
+          ? "lostToBridge"
+          : nextMode === "chain"
+            ? "lostToChain"
+            : nextMode === "joker"
+              ? "lostToJoker"
+              : null;
+    if (lossKey) {
+      this.markDebugCount(ctx, `exactFinalLoss.${lossKey}`);
+    }
+    const previousScore = previousBest.finalScore ?? previousBest.evalScore ?? 0;
+    const nextScore = nextBest.finalScore ?? nextBest.evalScore ?? 0;
+    if (Math.abs(nextScore - previousScore) <= 8) {
+      this.markDebugCount(ctx, "exactFinalLoss.lostToNonExactSameScoreBand");
+    }
   }
 
   buildProgressMove(state, ctx, phase) {
@@ -228,6 +384,7 @@ class AIBaseStrategy {
     let best = null;
     let frontier = [RummyAIUtils.cloneState(initialState)];
     let completed = true;
+    let passLastExactBest = null;
 
     for (let depth = 1; depth <= passConfig.maxDepth; depth += 1) {
       if (this.isTimedOut(ctx)) {
@@ -241,6 +398,9 @@ class AIBaseStrategy {
         const candidates = this.generateCandidates(state, ctx);
         if (ctx.debugEnabled && candidates.length > 0 && ctx.debugStats?._meta) {
           ctx.debugStats._meta.anyCandidates = true;
+          if (ctx.debugStats.timing.firstCandidateAtMs == null) {
+            ctx.debugStats.timing.firstCandidateAtMs = Date.now() - ctx.startedAt;
+          }
         }
         for (const candidate of candidates) {
           if (this.isTimedOut(ctx)) {
@@ -264,11 +424,22 @@ class AIBaseStrategy {
             if (ctx.debugEnabled && ctx.debugStats?._meta) {
               ctx.debugStats._meta.anyFinishable = true;
               this.markCandidateType(ctx, candidate, "finishableSeen");
+              ctx.debugStats.timing.finishableCount += 1;
+              if (ctx.debugStats.timing.firstFinishableAtMs == null) {
+                ctx.debugStats.timing.firstFinishableAtMs = Date.now() - ctx.startedAt;
+              }
             }
             candidate.finalScore = this.evaluateState(candidate, ctx, true);
             if (!best || this.compareCandidateOrder(candidate, best, ctx, "finalScore") < 0) {
+              this.recordExactFinalLoss(ctx, best, candidate, "beam-best-replace");
               best = candidate;
+              if (this.getCandidateDebugType(candidate) === "exact") {
+                passLastExactBest = candidate;
+              }
               this.markCandidateType(ctx, candidate, "topCandidateSeen");
+              if (ctx.debugEnabled) {
+                ctx.debugStats.timing.bestUpdateCount += 1;
+              }
               this.reportProgress(ctx, {
                 kind: "move",
                 move: this.buildProgressMove(candidate, ctx, `beam-d${depth}`),
@@ -289,6 +460,9 @@ class AIBaseStrategy {
       frontier = nextFrontier.slice(0, passConfig.beamWidth);
     }
 
+    if (passLastExactBest && best && passLastExactBest !== best) {
+      this.recordExactFinalLoss(ctx, passLastExactBest, best, "final-pass-best");
+    }
     return { best, completed };
   }
 
@@ -313,18 +487,45 @@ class AIBaseStrategy {
     if (state.tieBreakData) return state.tieBreakData;
 
     const openingGroups = state.table.slice(state.baseTableCount);
+    const primaryMode = this.getPrimaryActionMode(state);
+    const touchedGroups = state.stats?.touchedGroups || 0;
+    const effectiveTouchedGroups = ctx.featureFlags?.exactSelectionTuning && primaryMode === "exact"
+      ? Math.max(0, touchedGroups - 1)
+      : touchedGroups;
     state.tieBreakData = {
       rackReduction: ctx.initialRackSize - state.rack.length,
       openingScore: calculateInitialOpenScore(openingGroups),
       actionScore: state.stats?.actionScore || 0,
       futureMobility: this.countAppendableRackTiles(state),
-      touchedGroups: state.stats?.touchedGroups || 0
+      touchedGroups: effectiveTouchedGroups
     };
     return state.tieBreakData;
   }
 
   compareCandidateOrder(a, b, ctx, scoreSource = "evalScore") {
-    const primaryGap = this.getPrimaryScore(b, ctx, scoreSource) - this.getPrimaryScore(a, ctx, scoreSource);
+    const leftScore = this.getPrimaryScore(a, ctx, scoreSource);
+    const rightScore = this.getPrimaryScore(b, ctx, scoreSource);
+    const primaryGap = rightScore - leftScore;
+    if (ctx.featureFlags?.exactSelectionTuning && this.config.exactNearTiePreferExact && scoreSource === "finalScore") {
+      const leftMode = this.getCandidateDebugType(a);
+      const rightMode = this.getCandidateDebugType(b);
+      if (leftMode !== rightMode && (leftMode === "exact" || rightMode === "exact")) {
+        const exactCandidate = leftMode === "exact" ? a : b;
+        const otherCandidate = leftMode === "exact" ? b : a;
+        const scoreGap = Math.abs(leftScore - rightScore);
+        const threshold = 4;
+        const exactTieBreak = this.getCandidateTieBreakData(exactCandidate, ctx);
+        const otherTieBreak = this.getCandidateTieBreakData(otherCandidate, ctx);
+        if (
+          threshold > 0
+          && scoreGap <= threshold
+          && exactTieBreak.rackReduction >= otherTieBreak.rackReduction
+          && exactTieBreak.futureMobility + 1 >= otherTieBreak.futureMobility
+        ) {
+          return leftMode === "exact" ? -1 : 1;
+        }
+      }
+    }
     if (primaryGap !== 0) return primaryGap;
 
     const left = this.getCandidateTieBreakData(a, ctx);
@@ -871,6 +1072,12 @@ class AIBaseStrategy {
     next.stats.chainAppendMultiRecipient += statBoost.chainAppendMultiRecipient || 0;
     next.stats.chainAppendSameRecipientDouble += statBoost.chainAppendSameRecipientDouble || 0;
     next.stats.chainAppendTailBuilt += statBoost.chainAppendTailBuilt || 0;
+    next.stats.chainRepairFinishable += statBoost.chainRepairFinishable || 0;
+    next.stats.chainRepairRollbackUsed += statBoost.chainRepairRollbackUsed || 0;
+    next.stats.chainRepairDonorClosed += statBoost.chainRepairDonorClosed || 0;
+    next.stats.chainTailClosed += statBoost.chainTailClosed || 0;
+    next.stats.chainTailClosedWithRack += statBoost.chainTailClosedWithRack || 0;
+    next.stats.chainTailClosedAfterRollback += statBoost.chainTailClosedAfterRollback || 0;
     if (options.jokerNote) {
       next.meta.jokerNotes = [...(next.meta.jokerNotes || []), options.jokerNote];
     }
@@ -968,9 +1175,33 @@ class AIBaseStrategy {
     score += state.stats.chainAppendMultiRecipient * (this.config.weights.chainAppendMultiRecipient || 0);
     score += state.stats.chainAppendSameRecipientDouble * (this.config.weights.chainAppendSameRecipientDouble || 0);
     score += state.stats.chainAppendTailBuilt * (this.config.weights.chainAppendTailBuilt || 0);
+    score += state.stats.chainRepairFinishable * (this.config.weights.chainRepairFinishable || 0);
+    score += state.stats.chainRepairDonorClosed * (this.config.weights.chainRepairDonorClosed || 0);
+    score += state.stats.chainRepairRollbackUsed * (this.config.weights.chainRepairRollbackUsed || 0);
+    score += state.stats.chainTailClosed * (this.config.weights.chainTailClosed || 0);
+    score += state.stats.chainTailClosedWithRack * (this.config.weights.chainTailClosedWithRack || 0);
+    score += state.stats.chainTailClosedAfterRollback * (this.config.weights.chainTailClosedAfterRollback || 0);
     score -= fragileGroups * (this.config.weights.fragile || 0);
     score -= entropyPenalty * (this.config.weights.entropy || 0);
     score -= state.stats.jokerTrap * (this.config.weights.jokerTrap || 0);
+
+    const isExactCandidate = this.getCandidateDebugType(state) === "exact";
+    const crowdedThreshold = this.config.complexityCaps?.crowdedTableThreshold || 8;
+    const exactBonusEligible = terminal
+      && ctx.featureFlags?.exactSelectionTuning
+      && isExactCandidate
+      && rackReduction >= 1
+      && (
+        state.opened
+        || state.table.length >= crowdedThreshold
+        || (state.stats?.touchedGroups || 0) >= 3
+      );
+    if (exactBonusEligible) {
+      score += this.config.weights.exactFinishBonus || 0;
+      if (state.table.length >= crowdedThreshold || (state.stats?.touchedGroups || 0) >= 3) {
+        score += this.config.weights.exactCrowdedBonus || 0;
+      }
+    }
 
     if (ctx.gameState.ruleOptions.initial30 && !ctx.gameState.currentPlayer.opened) {
       const openingGroups = state.table.slice(state.baseTableCount);
@@ -1035,6 +1266,10 @@ class AIBaseStrategy {
     return this.withEffectiveConfig(state, ctx, () => {
       if (this.isOpeningPending(ctx) && !state.opened) {
         const openingMoves = this.generateOpeningMoves(state, ctx);
+        if (ctx.debugEnabled && ctx.debugStats?._meta && openingMoves.length > 0) {
+          ctx.debugStats._meta.anyGeneratedCandidates = true;
+          ctx.debugStats._meta.anyBaselineCandidates = true;
+        }
         return this.pickQuota(
           openingMoves,
           ctx,
@@ -1053,12 +1288,20 @@ class AIBaseStrategy {
         ...this.pickQuota(safeAppendMoves, ctx, this.config.safeAppendQuota ?? this.config.appendQuota ?? this.config.maxBranchesPerState),
         ...this.pickQuota(regularAppendMoves, ctx, this.config.appendQuota ?? this.config.maxBranchesPerState)
       ], ctx, this.config.maxBranchesPerState);
+      if (ctx.debugEnabled && ctx.debugStats?._meta && baselineMoves.length > 0) {
+        ctx.debugStats._meta.anyGeneratedCandidates = true;
+        ctx.debugStats._meta.anyBaselineCandidates = true;
+      }
 
       if (!this.config.allowRearrange || !state.opened) {
         return baselineMoves;
       }
 
       const advancedMoves = this.generateRearrangementMoves(state, ctx);
+      if (ctx.debugEnabled && ctx.debugStats?._meta && advancedMoves.length > 0) {
+        ctx.debugStats._meta.anyGeneratedCandidates = true;
+        ctx.debugStats._meta.anyRearrangementCandidates = true;
+      }
       return this.dedupeAndSortCandidates([
         ...baselineMoves,
         ...this.pickQuota(advancedMoves, ctx, this.config.rearrangeQuota ?? this.config.maxBranchesPerState)
@@ -1279,6 +1522,7 @@ class AIBaseStrategy {
     const maxRemove = Math.max(1, Math.min(options.maxRemove || 1, group.length - 1));
     const maxSolutions = options.maxSolutions || 2;
     const maxLooseTiles = options.maxLooseTiles ?? 2;
+    const sourceKind = RummyRules.explainGroup(group).kind || null;
     const plans = [];
 
     for (let removeCount = 1; removeCount <= maxRemove; removeCount += 1) {
@@ -1300,6 +1544,7 @@ class AIBaseStrategy {
               freedTiles: [...removedTiles],
               retainedGroups: deepCopy(partition.groups),
               looseTiles: [],
+              sourceKind,
               touchedCount: 1,
               score: (partition.score || 0) + removedTiles.length * 18 + partition.groups.length * 28
             });
@@ -1311,6 +1556,7 @@ class AIBaseStrategy {
             freedTiles: [...removedTiles],
             retainedGroups: [],
             looseTiles: [...remainingTiles],
+            sourceKind,
             touchedCount: 1,
             score: removedTiles.length * 18 + remainingTiles.length * 10
           });
@@ -1481,23 +1727,34 @@ class AIBaseStrategy {
   }
 
   findChainAppendTailPlan(state, ctx, freeTiles, budget) {
-    if (freeTiles.length === 0) {
+    const options = arguments.length > 4 ? arguments[4] : {};
+    if (freeTiles.length === 0 && !options.allowRackOnlyTail) {
       return {
         group: null,
         rackSubset: { ids: [], tiles: [], size: 0, score: 0 },
-        score: 0
+        score: 0,
+        stage: "closed"
       };
     }
 
-    const subsets = budget.maxRackSubsetSize > 0
-      ? RummyAIUtils.getRackSubsets(
-          state.rack,
-          budget.maxRackSubsetSize,
-          Math.min(this.config.maxRackSubsetBranches || 24, 12),
-          { ctx }
-        )
-      : [];
-    const candidates = [{ ids: [], tiles: [], size: 0, score: 0 }, ...subsets];
+    const freeOnlyPool = normalizeGroupTiles([...freeTiles]);
+    if (freeOnlyPool.length >= 3) {
+      const freeOnlyAnalysis = RummyRules.explainGroup(freeOnlyPool);
+      if (freeOnlyAnalysis.valid) {
+        return {
+          group: freeOnlyPool,
+          rackSubset: { ids: [], tiles: [], size: 0, score: 0 },
+          score: (freeOnlyAnalysis.score || 0) + freeOnlyPool.length * 12,
+          stage: "free-only",
+          closureKind: "free-only"
+        };
+      }
+    }
+
+    const subsets = this.getChainTailSubsetCandidates(state, ctx, freeTiles, budget, options);
+    const candidates = options.allowRackOnlyTail
+      ? [{ ids: [], tiles: [], size: 0, score: 0 }, ...subsets]
+      : subsets;
     let best = null;
 
     for (const subset of candidates) {
@@ -1506,10 +1763,17 @@ class AIBaseStrategy {
       if (pool.length < 3) continue;
       const analysis = RummyRules.explainGroup(pool);
       if (!analysis.valid) continue;
+      const closureMeta = this.describeChainTailClosure(pool, freeTiles, subset.tiles);
       const plan = {
         group: pool,
         rackSubset: subset,
-        score: (analysis.score || 0) + subset.score + pool.length * 10
+        score: (analysis.score || 0)
+          + (subset.score || 0)
+          + pool.length * 10
+          + (closureMeta.scoreBoost || 0)
+          - (closureMeta.usesJoker ? 12 : 0),
+        stage: subset.size > 0 ? "free-plus-rack" : "free-only",
+        closureKind: closureMeta.kind
       };
       if (!best || plan.score > best.score) {
         best = plan;
@@ -1517,6 +1781,509 @@ class AIBaseStrategy {
     }
 
     return best;
+  }
+
+  getChainTailSubsetCandidates(state, ctx, freeTiles, budget, options = {}) {
+    const maxRackSubsetSize = Math.max(
+      0,
+      Math.min(
+        options.maxRackSubsetSize ?? budget.maxRackSubsetSize ?? 0,
+        this.config.chainTailClosureMicroRackMax ?? budget.maxRackSubsetSize ?? 0
+      )
+    );
+    if (maxRackSubsetSize <= 0) return [];
+
+    const protectedSubsets = options.preferProtected
+      ? this.getProtectedRackSubsets(state, ctx, freeTiles)
+      : [];
+    const enumeratedSubsets = RummyAIUtils.enumerateRackSubsets(state.rack, { maxSize: maxRackSubsetSize, ctx });
+    const subsetMap = new Map();
+    [...protectedSubsets, ...enumeratedSubsets].forEach(subset => {
+      if (!subset || subset.size < 1 || subset.size > maxRackSubsetSize) return;
+      const key = (subset.ids || []).join(",");
+      const current = subsetMap.get(key);
+      if (!current || (subset.score || 0) > (current.score || 0)) {
+        subsetMap.set(key, subset);
+      }
+    });
+    const rawSubsets = [...subsetMap.values()];
+    const maxSubsetCandidates = Math.max(6, options.maxSubsetCandidates || 12);
+
+    return rawSubsets
+      .map(subset => {
+        const pool = normalizeGroupTiles([...freeTiles, ...subset.tiles]);
+        const analysis = pool.length >= 3 ? RummyRules.explainGroup(pool) : { valid: false };
+        const closureMeta = analysis.valid
+          ? this.describeChainTailClosure(pool, freeTiles, subset.tiles)
+          : { kind: "invalid", scoreBoost: -999, usesJoker: subset.tiles.some(tile => tile.joker) };
+        const noJokerBonus = closureMeta.usesJoker ? 0 : 12;
+        const subsetSizeBias = subset.size === 1 ? 14 : subset.size === 2 ? 6 : 2;
+        return {
+          ...subset,
+          closureMeta,
+          rankingScore: (closureMeta.scoreBoost || 0) + noJokerBonus + subsetSizeBias + (subset.score || 0)
+        };
+      })
+      .sort((a, b) =>
+        (b.rankingScore || 0) - (a.rankingScore || 0)
+        || (a.size || 0) - (b.size || 0)
+        || ((b.score || 0) - (a.score || 0))
+      )
+      .slice(0, maxSubsetCandidates);
+  }
+
+  describeChainTailClosure(pool, freeTiles, rackTiles = []) {
+    const analysis = RummyRules.explainGroup(pool);
+    const freeNonJokers = (freeTiles || []).filter(tile => !tile.joker);
+    const rackNonJokers = (rackTiles || []).filter(tile => !tile.joker);
+    const usesJoker = pool.some(tile => tile.joker);
+    if (!analysis.valid) {
+      return { kind: "invalid", scoreBoost: -999, usesJoker };
+    }
+
+    const allNonJokers = [...freeNonJokers, ...rackNonJokers];
+    if (allNonJokers.length > 0 && allNonJokers.every(tile => tile.number === allNonJokers[0].number)) {
+      return { kind: "same-number", scoreBoost: 34, usesJoker };
+    }
+
+    if (analysis.kind === "run" || analysis.kind === "wild") {
+      const freeNumbers = freeNonJokers.map(tile => tile.number).sort((a, b) => a - b);
+      const rackNumbers = rackNonJokers.map(tile => tile.number).sort((a, b) => a - b);
+      const freeMin = freeNumbers.length > 0 ? freeNumbers[0] : null;
+      const freeMax = freeNumbers.length > 0 ? freeNumbers[freeNumbers.length - 1] : null;
+      const directAppend = rackNumbers.length > 0
+        && freeMin != null
+        && rackNumbers.every(number => number < freeMin || number > freeMax);
+      const gapFill = rackNumbers.length > 0
+        && freeMin != null
+        && rackNumbers.some(number => number > freeMin && number < freeMax);
+      if (directAppend) {
+        return { kind: "direct-run-end", scoreBoost: 26, usesJoker };
+      }
+      if (gapFill) {
+        return { kind: "single-gap", scoreBoost: 20, usesJoker };
+      }
+    }
+
+    return { kind: "generic", scoreBoost: 10, usesJoker };
+  }
+
+  estimateDonorRetainedClosurePotential(ctx, freeTiles, retainedPlans = []) {
+    if (!freeTiles?.length || !retainedPlans?.length) return 0;
+    const validGroups = RummyAIUtils.getValidGroupsFromTiles(
+      freeTiles,
+      ctx.poolGroupCache,
+      {
+        maxSize: freeTiles.length,
+        ctx
+      }
+    );
+    for (const donorPlan of retainedPlans) {
+      const looseIds = (donorPlan.looseTiles || []).map(tile => tile.id);
+      if (looseIds.length === 0) continue;
+      const matches = validGroups.some(group =>
+        looseIds.every(id => group.ids.includes(id))
+        && (!donorPlan.sourceKind || donorPlan.sourceKind === "wild" || group.kind === donorPlan.sourceKind || group.kind === "wild")
+      );
+      if (matches) return 20;
+    }
+    return 0;
+  }
+
+  estimateChainTailClosurePotential(state, ctx, input) {
+    const freeTiles = normalizeGroupTiles([...(input?.freeTiles || [])]);
+    const retainedPlans = input?.retainedPlans || [];
+    const budget = input?.budget || {};
+    if (freeTiles.length === 0) {
+      return { score: 100, stage: "closed", tailPlan: null };
+    }
+
+    const preview = this.findChainAppendTailPlan(state, ctx, freeTiles, budget, {
+      preferProtected: true,
+      maxRackSubsetSize: this.config.chainTailClosureMicroRackMax ?? budget.maxRackSubsetSize,
+      maxSubsetCandidates: this.level >= 6 ? 14 : 10
+    });
+
+    let score = 0;
+    if (preview?.group) {
+      const rackSize = preview.rackSubset?.size || 0;
+      if (rackSize === 0) score += 80;
+      else if (rackSize === 1) score += 55;
+      else if (rackSize === 2) score += 35;
+      else score += 24;
+      score += preview.score || 0;
+    } else {
+      score += this.estimateDonorRetainedClosurePotential(ctx, freeTiles, retainedPlans);
+    }
+
+    if (preview?.group?.some(tile => tile.joker)) {
+      score -= 12;
+    }
+    if (!preview?.group && freeTiles.length >= 4) {
+      score -= 18;
+    }
+
+    return {
+      score,
+      stage: preview?.stage || (score > 0 ? "retained-assist" : "none"),
+      tailPlan: preview || null
+    };
+  }
+
+  cloneChainAppendPlan(plan) {
+    return {
+      ...plan,
+      donorGroupIndices: [...(plan.donorGroupIndices || [])],
+      recipientGroupIndices: [...(plan.recipientGroupIndices || [])],
+      donorPlans: (plan.donorPlans || []).map(entry => ({
+        ...entry,
+        freedTiles: deepCopy(entry.freedTiles || []),
+        retainedGroups: deepCopy(entry.retainedGroups || []),
+        looseTiles: deepCopy(entry.looseTiles || [])
+      })),
+      retainedGroups: deepCopy(plan.retainedGroups || []),
+      recipientExtensions: deepCopy(plan.recipientExtensions || []),
+      recipientExtensionBuckets: deepCopy(plan.recipientExtensionBuckets || []),
+      originalFreeTiles: deepCopy(plan.originalFreeTiles || []),
+      remainingFreeTiles: deepCopy(plan.remainingFreeTiles || []),
+      tailPlan: plan.tailPlan
+        ? {
+            ...plan.tailPlan,
+            group: plan.tailPlan.group ? deepCopy(plan.tailPlan.group) : null,
+            rackSubset: plan.tailPlan.rackSubset
+              ? {
+                  ...plan.tailPlan.rackSubset,
+                  ids: [...(plan.tailPlan.rackSubset.ids || [])],
+                  tiles: deepCopy(plan.tailPlan.rackSubset.tiles || [])
+                }
+              : { ids: [], tiles: [], size: 0, score: 0 }
+          }
+        : null,
+      budget: { ...(plan.budget || {}) },
+      repairFlags: { ...(plan.repairFlags || {}) }
+    };
+  }
+
+  buildChainPlanResult(state, ctx, plan) {
+    const consumedIds = new Set();
+    for (const extension of plan.recipientExtensions || []) {
+      for (const tileId of extension.consumedIds || []) {
+        if (consumedIds.has(tileId)) {
+          return { candidate: null, finishable: false, rejectReason: "invalidRecipient" };
+        }
+        consumedIds.add(tileId);
+      }
+    }
+
+    const recipientValid = (plan.recipientExtensions || []).every(extension =>
+      RummyRules.explainGroup(extension.resultGroup || []).valid
+    );
+    if (!recipientValid) {
+      return { candidate: null, finishable: false, rejectReason: "invalidRecipient" };
+    }
+
+    const retainedValid = (plan.retainedGroups || []).every(group => RummyRules.analyzeGroup(group).valid);
+    if (!retainedValid) {
+      return { candidate: null, finishable: false, rejectReason: "invalidRetained" };
+    }
+
+    if (plan.tailPlan?.group && !RummyRules.analyzeGroup(plan.tailPlan.group).valid) {
+      return { candidate: null, finishable: false, rejectReason: "tailMissing" };
+    }
+    if ((plan.remainingFreeTiles?.length || 0) > 0 && !plan.tailPlan?.group) {
+      return {
+        candidate: null,
+        finishable: false,
+        rejectReason: plan.budget.requireAllFreedTilesUsedOrRetained ? "leftoverFreeTiles" : "tailMissing"
+      };
+    }
+
+    const candidate = this.buildChainAppendCandidate(state, ctx, plan);
+    if (!candidate) {
+      return { candidate: null, finishable: false, rejectReason: "noRepairFound" };
+    }
+    const finishable = this.canFinishTurn(candidate, ctx);
+    return { candidate, finishable, rejectReason: finishable ? null : "noRepairFound" };
+  }
+
+  applyChainDonorReclose(ctx, plan) {
+    let repaired = false;
+    for (const donorPlan of plan.donorPlans || []) {
+      if (!donorPlan.looseTiles || donorPlan.looseTiles.length === 0) continue;
+      const looseIds = donorPlan.looseTiles.map(tile => tile.id);
+      if (!looseIds.every(id => plan.remainingFreeTiles.some(tile => tile.id === id))) continue;
+      const validGroups = RummyAIUtils.getValidGroupsFromTiles(
+        plan.remainingFreeTiles,
+        ctx.poolGroupCache,
+        {
+          maxSize: plan.remainingFreeTiles.length,
+          ctx
+        }
+      );
+      const candidates = validGroups
+        .filter(group => looseIds.every(id => group.ids.includes(id)))
+        .filter(group => {
+          if (!donorPlan.sourceKind || donorPlan.sourceKind === "wild") return true;
+          return group.kind === donorPlan.sourceKind || group.kind === "wild";
+        })
+        .sort((a, b) =>
+          b.score - a.score
+          || a.ids.length - b.ids.length
+        );
+      if (candidates.length === 0) continue;
+      const chosen = candidates[0];
+      const chosenIds = new Set(chosen.ids);
+      plan.retainedGroups.push(normalizeGroupTiles(deepCopy(chosen.tiles)));
+      plan.remainingFreeTiles = plan.remainingFreeTiles.filter(tile => !chosenIds.has(tile.id));
+      repaired = true;
+    }
+    return repaired;
+  }
+
+  rebuildChainPlanWithRecipients(state, ctx, plan, recipientExtensions, options = {}) {
+    const nextPlan = this.cloneChainAppendPlan(plan);
+    nextPlan.recipientExtensions = deepCopy(recipientExtensions);
+    const consumedIds = new Set();
+    nextPlan.recipientExtensions.forEach(extension => {
+      (extension.consumedIds || []).forEach(id => consumedIds.add(id));
+    });
+    nextPlan.remainingFreeTiles = (plan.originalFreeTiles || []).filter(tile => !consumedIds.has(tile.id));
+    nextPlan.retainedGroups = deepCopy(plan.retainedGroups || []);
+    if (options.recloseDonor) {
+      nextPlan.repairFlags.chainRepairDonorClosed = this.applyChainDonorReclose(ctx, nextPlan) ? 1 : 0;
+    }
+    nextPlan.tailPlan = this.findChainAppendTailPlan(
+      state,
+      ctx,
+      nextPlan.remainingFreeTiles,
+      nextPlan.budget,
+      options.tailOptions || {}
+    );
+    nextPlan.tailClosurePotential = this.estimateChainTailClosurePotential(state, ctx, {
+      freeTiles: nextPlan.remainingFreeTiles,
+      retainedPlans: nextPlan.donorPlans,
+      recipientExtensions: nextPlan.recipientExtensions,
+      budget: nextPlan.budget
+    }).score;
+    return nextPlan;
+  }
+
+  recordSuccessfulChainRepair(ctx, plan) {
+    const repairFlags = plan?.repairFlags || {};
+    const repaired = repairFlags.chainRepairDonorClosed
+      || repairFlags.chainRepairRollbackUsed
+      || repairFlags.chainRepairFinishable;
+    if (repaired) {
+      this.markChainRepair(ctx, "repairedFinishable");
+    }
+    if (repairFlags.chainRepairDonorClosed) {
+      this.markChainRepair(ctx, "donorReclosed");
+      this.markChainRepair(ctx, "retainedAssistTail");
+    }
+    if (repairFlags.chainRepairRollbackUsed) {
+      this.markChainRepair(ctx, "recipientRollback");
+    }
+    if (repairFlags.chainRepairRollbackTailAware) {
+      this.markChainRepair(ctx, "recipientRollbackTailAware");
+    }
+    if (repairFlags.chainRepairMicroTailBuilt) {
+      this.markChainRepair(ctx, "microTailBuilt");
+    }
+    if (plan?.tailPlan?.stage === "free-only") {
+      this.markChainRepair(ctx, "freeOnlyTail");
+    } else if (plan?.tailPlan?.stage === "free-plus-rack") {
+      this.markChainRepair(ctx, "freePlusRackTail");
+    }
+  }
+
+  tryChainPlanWithMicroTail(state, ctx, plan, repairFlags = {}) {
+    let attempt = this.buildChainPlanResult(state, ctx, plan);
+    const fallbackCandidate = attempt.candidate || null;
+    if (attempt.candidate && attempt.finishable) {
+      this.recordSuccessfulChainRepair(ctx, plan);
+      return {
+        candidate: attempt.candidate,
+        plan,
+        rejectReason: null
+      };
+    }
+
+    const shouldTryMicroTail = ctx.featureFlags?.chainRepair
+      && (plan.remainingFreeTiles?.length || 0) <= 3
+      && (plan.remainingFreeTiles?.length || 0) >= 1;
+    if (!shouldTryMicroTail) {
+      return {
+        candidate: fallbackCandidate,
+        plan,
+        rejectReason: attempt.rejectReason || "noRepairFound"
+      };
+    }
+
+    const microPlan = this.cloneChainAppendPlan(plan);
+    microPlan.tailPlan = this.findChainAppendTailPlan(
+      state,
+      ctx,
+      microPlan.remainingFreeTiles,
+      microPlan.budget,
+      {
+        preferProtected: true,
+        maxRackSubsetSize: this.config.chainTailClosureMicroRackMax ?? (this.level >= 6 ? 3 : 2),
+        maxSubsetCandidates: this.level >= 6 ? 14 : 10
+      }
+    );
+    microPlan.repairFlags = {
+      ...(plan.repairFlags || {}),
+      ...repairFlags,
+      chainRepairMicroTailBuilt: microPlan.tailPlan?.group ? 1 : 0,
+      chainRepairFinishable: 1
+    };
+    attempt = this.buildChainPlanResult(state, ctx, microPlan);
+    if (attempt.candidate && attempt.finishable) {
+      this.recordSuccessfulChainRepair(ctx, microPlan);
+      return {
+        candidate: attempt.candidate,
+        plan: microPlan,
+        rejectReason: null
+      };
+    }
+
+    return {
+      candidate: fallbackCandidate || attempt.candidate || null,
+      plan: microPlan,
+      rejectReason: attempt.rejectReason || "noRepairFound"
+    };
+  }
+
+  repairChainToFinishable(state, ctx, plan, options = {}) {
+    const basePlan = this.cloneChainAppendPlan(plan);
+    let outcome = this.tryChainPlanWithMicroTail(state, ctx, basePlan, basePlan.repairFlags || {});
+    if (outcome.candidate && !outcome.rejectReason) return outcome;
+
+    let lastRejectReason = outcome.rejectReason || "noRepairFound";
+    let fallbackCandidate = outcome.candidate || null;
+    let fallbackPlan = outcome.plan || basePlan;
+    if (ctx.featureFlags?.chainRepair) {
+      const donorPlan = this.cloneChainAppendPlan(plan);
+      const donorClosed = this.applyChainDonorReclose(ctx, donorPlan);
+      if (donorClosed) {
+        donorPlan.repairFlags = {
+          ...(donorPlan.repairFlags || {}),
+          chainRepairDonorClosed: 1,
+          chainRepairFinishable: 1
+        };
+        donorPlan.tailPlan = this.findChainAppendTailPlan(state, ctx, donorPlan.remainingFreeTiles, donorPlan.budget);
+        donorPlan.tailClosurePotential = this.estimateChainTailClosurePotential(state, ctx, {
+          freeTiles: donorPlan.remainingFreeTiles,
+          retainedPlans: donorPlan.donorPlans,
+          recipientExtensions: donorPlan.recipientExtensions,
+          budget: donorPlan.budget
+        }).score;
+        outcome = this.tryChainPlanWithMicroTail(state, ctx, donorPlan, donorPlan.repairFlags);
+        if (outcome.candidate && !outcome.rejectReason) return outcome;
+        lastRejectReason = outcome.rejectReason || lastRejectReason;
+        if (!fallbackCandidate && outcome.candidate) {
+          fallbackCandidate = outcome.candidate;
+          fallbackPlan = outcome.plan || donorPlan;
+        }
+      }
+
+      if ((plan.recipientExtensions || []).length > 1) {
+        const rollbackPlans = [...plan.recipientExtensions]
+          .map((extension, index) => {
+            const recipientExtensions = plan.recipientExtensions.filter((_, entryIndex) => entryIndex !== index);
+            const rollbackPlan = this.rebuildChainPlanWithRecipients(
+              state,
+              ctx,
+              plan,
+              recipientExtensions,
+              { recloseDonor: true }
+            );
+            rollbackPlan.repairFlags = {
+              ...(rollbackPlan.repairFlags || {}),
+              chainRepairRollbackUsed: 1,
+              chainRepairFinishable: 1
+            };
+            const tailPotential = this.estimateChainTailClosurePotential(state, ctx, {
+              freeTiles: rollbackPlan.remainingFreeTiles,
+              retainedPlans: rollbackPlan.donorPlans,
+              recipientExtensions: rollbackPlan.recipientExtensions,
+              budget: rollbackPlan.budget
+            });
+            rollbackPlan.tailClosurePotential = tailPotential.score;
+            return {
+              index,
+              extension,
+              rollbackPlan,
+              tailPotential
+            };
+          })
+          .sort((a, b) =>
+            (b.tailPotential.score || 0) - (a.tailPotential.score || 0)
+            || ((a.extension.score || 0) - (b.extension.score || 0))
+          );
+        for (const removal of rollbackPlans) {
+          const rollbackPlan = removal.rollbackPlan;
+          rollbackPlan.repairFlags = {
+            ...(rollbackPlan.repairFlags || {}),
+            chainRepairRollbackTailAware: this.config.chainTailClosureRollbackAware ? 1 : 0
+          };
+          outcome = this.tryChainPlanWithMicroTail(state, ctx, rollbackPlan, rollbackPlan.repairFlags);
+          if (outcome.candidate && !outcome.rejectReason) return outcome;
+          lastRejectReason = outcome.rejectReason || lastRejectReason;
+          if (!fallbackCandidate && outcome.candidate) {
+            fallbackCandidate = outcome.candidate;
+            fallbackPlan = outcome.plan || rollbackPlan;
+          }
+          if (this.level <= 5) break;
+        }
+      }
+
+      if (this.level >= 6) {
+        for (let index = 0; index < (plan.recipientExtensions || []).length; index += 1) {
+          const extension = plan.recipientExtensions[index];
+          if ((extension.sameRecipientDouble || 0) <= 0) continue;
+          const bucket = plan.recipientExtensionBuckets?.[index] || [];
+          const smaller = bucket.find(candidate =>
+            (candidate.consumedTiles?.length || 0) < (extension.consumedTiles?.length || 0)
+          );
+          if (!smaller) continue;
+          const recipientExtensions = plan.recipientExtensions.map((entry, entryIndex) =>
+            entryIndex === index ? deepCopy(smaller) : deepCopy(entry)
+          );
+          const rollbackPlan = this.rebuildChainPlanWithRecipients(
+            state,
+            ctx,
+            plan,
+            recipientExtensions,
+            { recloseDonor: true }
+          );
+          rollbackPlan.repairFlags = {
+            ...(rollbackPlan.repairFlags || {}),
+            chainRepairRollbackUsed: 1,
+            chainRepairFinishable: 1
+          };
+          outcome = this.tryChainPlanWithMicroTail(state, ctx, rollbackPlan, rollbackPlan.repairFlags);
+          if (outcome.candidate && !outcome.rejectReason) return outcome;
+          lastRejectReason = outcome.rejectReason || lastRejectReason;
+          if (!fallbackCandidate && outcome.candidate) {
+            fallbackCandidate = outcome.candidate;
+            fallbackPlan = outcome.plan || rollbackPlan;
+          }
+          break;
+        }
+      }
+    }
+
+    if ((lastRejectReason === "tailMissing" || lastRejectReason === "leftoverFreeTiles" || lastRejectReason === "noRepairFound")
+      && (fallbackPlan?.tailClosurePotential ?? plan.tailClosurePotential ?? 0) < 20) {
+      this.markChainReject(ctx, "tailClosureLowPotential");
+    }
+    this.markChainReject(ctx, lastRejectReason || "noRepairFound");
+    return {
+      candidate: fallbackCandidate,
+      plan: fallbackPlan,
+      rejectReason: lastRejectReason || "noRepairFound"
+    };
   }
 
   buildChainAppendCandidate(state, ctx, plan) {
@@ -1567,7 +2334,13 @@ class AIBaseStrategy {
         chainAppendCount: plan.recipientExtensions.length,
         chainAppendMultiRecipient: plan.recipientExtensions.length >= 2 ? 1 : 0,
         chainAppendSameRecipientDouble: plan.recipientExtensions.some(extension => extension.sameRecipientDouble > 0) ? 1 : 0,
-        chainAppendTailBuilt: plan.tailPlan?.group ? 1 : 0
+        chainAppendTailBuilt: plan.tailPlan?.group ? 1 : 0,
+        chainRepairFinishable: plan.repairFlags?.chainRepairFinishable ? 1 : 0,
+        chainRepairRollbackUsed: plan.repairFlags?.chainRepairRollbackUsed ? 1 : 0,
+        chainRepairDonorClosed: plan.repairFlags?.chainRepairDonorClosed ? 1 : 0,
+        chainTailClosed: plan.tailPlan?.group ? 1 : 0,
+        chainTailClosedWithRack: (plan.tailPlan?.rackSubset?.size || 0) > 0 ? 1 : 0,
+        chainTailClosedAfterRollback: plan.repairFlags?.chainRepairRollbackUsed ? 1 : 0
       }
     });
   }
@@ -1587,13 +2360,13 @@ class AIBaseStrategy {
     for (const donorCombo of donorCombos) {
       if (this.isTimedOut(ctx) || candidates.length >= candidateLimit) break;
 
-      const donorPlanBuckets = donorCombo.indices.map(index =>
-        this.getFlexibleExtractionPlans(state.table[index], ctx, {
-          maxRemove: Math.min(2, budget.maxFreeTableTiles || 4),
-          maxSolutions: 2,
-          maxLooseTiles: Math.min(2, budget.maxFreeTableTiles || 4)
-        }).slice(0, 4)
-      );
+        const donorPlanBuckets = donorCombo.indices.map(index =>
+          this.getFlexibleExtractionPlans(state.table[index], ctx, {
+            maxRemove: Math.min(2, budget.maxFreeTableTiles || 4),
+            maxSolutions: 2,
+            maxLooseTiles: Math.min(2, budget.maxFreeTableTiles || 4)
+          }).slice(0, 6)
+        );
       if (donorPlanBuckets.some(bucket => bucket.length === 0)) continue;
 
       const continueDonorPlans = RummyAIUtils.cartesianPick(donorPlanBuckets, ctx, (selectedPlans) => {
@@ -1628,6 +2401,7 @@ class AIBaseStrategy {
           );
           if (extensionBuckets.some(bucket => bucket.length === 0)) continue;
 
+          const recipientPlans = [];
           const continueRecipients = RummyAIUtils.cartesianPick(extensionBuckets, ctx, (recipientExtensions) => {
             if (this.isTimedOut(ctx) || candidates.length >= candidateLimit) return false;
 
@@ -1640,31 +2414,61 @@ class AIBaseStrategy {
             }
 
             const remainingFreeTiles = freeTiles.filter(tile => !consumedIds.has(tile.id));
-            const tailPlan = this.findChainAppendTailPlan(state, ctx, remainingFreeTiles, budget);
-            if (remainingFreeTiles.length > 0 && !tailPlan?.group) return true;
-
-            const candidate = this.buildChainAppendCandidate(state, ctx, {
-              donorGroupIndices,
-              recipientGroupIndices,
-              retainedGroups,
+            const tailPotential = this.estimateChainTailClosurePotential(state, ctx, {
+              freeTiles: remainingFreeTiles,
+              retainedPlans: selectedPlans,
               recipientExtensions,
-              remainingFreeTiles,
-              tailPlan,
               budget
             });
-            if (candidate) candidates.push(candidate);
-            return candidates.length < candidateLimit;
+            const structureScore = recipientExtensions.reduce((sum, extension) => sum + (extension.score || 0), 0)
+              + recipientExtensions.length * 20
+              + (recipientExtensions.some(extension => extension.sameRecipientDouble > 0) ? 12 : 0);
+            recipientPlans.push({
+              recipientExtensions: deepCopy(recipientExtensions),
+              remainingFreeTiles,
+              tailPlan: tailPotential.tailPlan,
+              tailClosurePotential: tailPotential.score,
+              rankingScore: tailPotential.score * (this.config.chainTailClosureBias || 1) + structureScore
+            });
+            return true;
           });
           if (continueRecipients === false) return false;
+
+          recipientPlans
+            .sort((a, b) =>
+              (b.rankingScore || 0) - (a.rankingScore || 0)
+              || ((b.tailClosurePotential || 0) - (a.tailClosurePotential || 0))
+            )
+            .slice(0, Math.max(4, (this.config.chainAppendQuota || 4) * 2))
+            .forEach(planEntry => {
+              if (this.isTimedOut(ctx) || candidates.length >= candidateLimit) return;
+              if ((planEntry.tailClosurePotential || 0) < 0) {
+                this.markChainReject(ctx, "tailClosureLowPotential");
+                return;
+              }
+              const chainPlan = {
+                donorGroupIndices,
+                donorPlans: selectedPlans,
+                recipientGroupIndices,
+                retainedGroups,
+                recipientExtensions: planEntry.recipientExtensions,
+                recipientExtensionBuckets: extensionBuckets,
+                originalFreeTiles: freeTiles,
+                remainingFreeTiles: planEntry.remainingFreeTiles,
+                tailPlan: planEntry.tailPlan,
+                tailClosurePotential: planEntry.tailClosurePotential,
+                budget,
+                repairFlags: {}
+              };
+              const repaired = this.repairChainToFinishable(state, ctx, chainPlan);
+              if (repaired.candidate) candidates.push(repaired.candidate);
+            });
         }
         return candidates.length < candidateLimit;
       });
       if (continueDonorPlans === false) break;
     }
 
-    if (ctx.debugEnabled) {
-      candidates.forEach(candidate => this.markCandidateType(ctx, candidate, "generated"));
-    }
     if (ctx.debugEnabled) {
       candidates.forEach(candidate => this.markCandidateType(ctx, candidate, "generated"));
     }

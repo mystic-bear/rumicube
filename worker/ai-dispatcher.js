@@ -18,10 +18,74 @@ class RummyAI {
         strategicDraw_chain: 0
       },
       topCandidateSeen: { exact: 0, chain: 0 },
+      chainFinishReject: {
+        tailMissing: 0,
+        leftoverFreeTiles: 0,
+        invalidRetained: 0,
+        invalidRecipient: 0,
+        noRepairFound: 0,
+        tailClosureLowPotential: 0
+      },
+      chainRepair: {
+        donorReclosed: 0,
+        recipientRollback: 0,
+        recipientRollbackTailAware: 0,
+        microTailBuilt: 0,
+        repairedFinishable: 0,
+        retainedAssistTail: 0,
+        freeOnlyTail: 0,
+        freePlusRackTail: 0
+      },
+      exactFinalLoss: {
+        lostToAppend: 0,
+        lostToSingle: 0,
+        lostToBridge: 0,
+        lostToChain: 0,
+        lostToJoker: 0,
+        lostToNonExactSameScoreBand: 0
+      },
+      exactLastLoss: {
+        seen: false,
+        phase: null,
+        exactScore: null,
+        exactRackReduction: null,
+        exactFutureMobility: null,
+        exactTouchedGroups: null,
+        exactActions: null,
+        winnerMode: null,
+        winnerScore: null,
+        winnerRackReduction: null,
+        winnerFutureMobility: null,
+        winnerTouchedGroups: null,
+        scoreGap: null
+      },
+      finalSelectionReason: {
+        exactReachedDispatcher: 0,
+        exactChosenAtDispatcher: 0,
+        exactLostAtDispatcher: 0
+      },
+      nullDetail: {
+        noGeneratedCandidates: 0,
+        noRearrangementCandidates: 0,
+        beamNoFinishable: 0,
+        timeoutNoFinishableEver: 0,
+        timeoutAfterSomeFinishable: 0,
+        openingConstraint: 0
+      },
+      timing: {
+        firstCandidateAtMs: null,
+        firstFinishableAtMs: null,
+        bestUpdateCount: 0,
+        finishableCount: 0
+      },
       _meta: {
         anyCandidates: false,
         anyFinishable: false,
-        softDeadline: false
+        softDeadline: false,
+        anyGeneratedCandidates: false,
+        anyBaselineCandidates: false,
+        anyRearrangementCandidates: false,
+        openingPending: !!gameState?.ruleOptions?.initial30 && !gameState?.currentPlayer?.opened
       }
     };
   }
@@ -218,6 +282,14 @@ class RummyAI {
         }
         chosen = passesFloor ? expertMove : floorMove;
       }
+      if (debugEnabled && this.getMoveDebugType(expertMove) === "exact") {
+        this.markDebugCount(debugStats, "finalSelectionReason.exactReachedDispatcher");
+        if (this.getMoveDebugType(chosen) === "exact") {
+          this.markDebugCount(debugStats, "finalSelectionReason.exactChosenAtDispatcher");
+        } else {
+          this.markDebugCount(debugStats, "finalSelectionReason.exactLostAtDispatcher");
+        }
+      }
       bestChosenSoFar = chosen;
       if (this.isDeadlineReached(nextOptions)) {
         const move = this.annotatePartialMove(
@@ -277,10 +349,22 @@ class RummyAI {
     if (debugEnabled && !chosen) {
       if (debugStats?._meta?.softDeadline || this.isDeadlineReached(nextOptions)) {
         this.markDebugCount(debugStats, "nullReason.softDeadline");
+        if (debugStats?.timing?.firstFinishableAtMs == null) {
+          this.markDebugCount(debugStats, "nullDetail.timeoutNoFinishableEver");
+        } else {
+          this.markDebugCount(debugStats, "nullDetail.timeoutAfterSomeFinishable");
+        }
+      } else if (debugStats?._meta?.openingPending && !debugStats?._meta?.anyFinishable) {
+        this.markDebugCount(debugStats, "nullDetail.openingConstraint");
       } else if (debugStats?._meta?.anyCandidates) {
         this.markDebugCount(debugStats, "nullReason.noFinishable");
+        this.markDebugCount(debugStats, "nullDetail.beamNoFinishable");
+        if (debugStats?._meta?.anyBaselineCandidates && !debugStats?._meta?.anyRearrangementCandidates) {
+          this.markDebugCount(debugStats, "nullDetail.noRearrangementCandidates");
+        }
       } else {
         this.markDebugCount(debugStats, "nullReason.noCandidates");
+        this.markDebugCount(debugStats, "nullDetail.noGeneratedCandidates");
       }
     }
     if (nextOptions.includeDebug) {
